@@ -10,7 +10,6 @@
  */
 
 import {
-  CATEGORY_TREE_FAN_OUT_MAX,
   DEFAULT_API_ORIGIN,
   PAGE_LIMIT_DEFAULT,
   PAGE_LIMIT_MAX,
@@ -413,6 +412,11 @@ function summarizeOrder(order: Row): Row {
   };
 }
 
+/**
+ * The stated job of `list_customers` is turning an email into a customer ID.
+ * Phone numbers are not needed for that, and everything an agent reads lands
+ * in a run transcript, so the row stops at what the job needs.
+ */
 function summarizeCustomer(customer: Row): Row {
   return {
     id: customer.id,
@@ -420,20 +424,97 @@ function summarizeCustomer(customer: Row): Row {
     firstName: customer.first_name ?? null,
     lastName: customer.last_name ?? null,
     company: customer.company ?? null,
-    phone: customer.phone ?? null,
     customerGroupId: customer.customer_group_id ?? null,
     dateCreated: customer.date_created ?? null,
   };
 }
 
-function summarizeCategory(category: Row, treeId: unknown): Row {
+/**
+ * One row of `/v3/catalog/trees/categories`.
+ *
+ * The flat endpoint names the primary key `category_id` and carries `tree_id`
+ * on every row, which is why this plugin reads the flat endpoint rather than
+ * `/v3/catalog/trees/{tree_id}/categories` — that one returns a nested
+ * `CategoryNode` tree whose rows have none of these fields. See README
+ * "Which categories endpoint".
+ */
+function summarizeCategory(category: Row, treeNames: Map<number, unknown>): Row {
+  const treeId = category.tree_id ?? null;
   return {
-    id: category.category_id ?? category.id,
+    id: category.category_id ?? null,
     treeId,
+    treeName: typeof treeId === "number" ? treeNames.get(treeId) ?? null : null,
     parentId: category.parent_id ?? null,
     name: category.name,
     isVisible: category.is_visible ?? null,
     sortOrder: category.sort_order ?? null,
+  };
+}
+
+/**
+ * The fields `get_order` passes through, and the ones it does not.
+ *
+ * Every other tool returns an allowlisted row; this one used to return the
+ * upstream record whole, which made its PII surface whatever BigCommerce
+ * happened to send — including the shopper's IP address and the merchant's
+ * internal staff notes, and tomorrow whatever they add next. The allowlist
+ * covers the order's state, its money, its payment and the billing address the
+ * tool's description promises. It deliberately drops `ip_address`,
+ * `ip_address_v6` and `geoip_country*` (shopper network identity, which answers
+ * no order question), `staff_notes` (internal free text), the external
+ * marketplace IDs, and the `products` / `shipping_addresses` / `consignments`
+ * sub-resource links — line items have their own tool.
+ */
+function summarizeOrderDetail(order: Row): Row {
+  const billing = asRow(order.billing_address);
+  return {
+    id: order.id,
+    status: order.status,
+    statusId: order.status_id,
+    orderSource: order.order_source ?? null,
+    channelId: order.channel_id ?? null,
+    isDeleted: order.is_deleted ?? null,
+    dateCreated: order.date_created,
+    dateModified: order.date_modified ?? null,
+    dateShipped: order.date_shipped ?? null,
+    customerId: order.customer_id,
+    customerMessage: order.customer_message ?? null,
+    itemsTotal: order.items_total ?? null,
+    itemsShipped: order.items_shipped ?? null,
+    orderIsDigital: order.order_is_digital ?? null,
+    currencyCode: order.currency_code ?? null,
+    currencyExchangeRate: order.currency_exchange_rate ?? null,
+    subtotalExTax: order.subtotal_ex_tax ?? null,
+    subtotalIncTax: order.subtotal_inc_tax ?? null,
+    discountAmount: order.discount_amount ?? null,
+    couponDiscount: order.coupon_discount ?? null,
+    shippingCostExTax: order.shipping_cost_ex_tax ?? null,
+    shippingCostIncTax: order.shipping_cost_inc_tax ?? null,
+    handlingCostIncTax: order.handling_cost_inc_tax ?? null,
+    wrappingCostIncTax: order.wrapping_cost_inc_tax ?? null,
+    totalExTax: order.total_ex_tax ?? null,
+    totalIncTax: order.total_inc_tax ?? null,
+    totalTax: order.total_tax ?? null,
+    refundedAmount: order.refunded_amount ?? null,
+    storeCreditAmount: order.store_credit_amount ?? null,
+    giftCertificateAmount: order.gift_certificate_amount ?? null,
+    paymentMethod: order.payment_method ?? null,
+    paymentStatus: order.payment_status ?? null,
+    shippingAddressCount: order.shipping_address_count ?? null,
+    billingAddress: {
+      firstName: billing.first_name ?? null,
+      lastName: billing.last_name ?? null,
+      company: billing.company ?? null,
+      street1: billing.street_1 ?? null,
+      street2: billing.street_2 ?? null,
+      city: billing.city ?? null,
+      state: billing.state ?? null,
+      zip: billing.zip ?? null,
+      country: billing.country ?? null,
+      countryIso2: billing.country_iso2 ?? null,
+      email: billing.email ?? null,
+      phone: billing.phone ?? null,
+    },
   };
 }
 
@@ -460,7 +541,13 @@ export async function executeTool(
       rejectUnknownKeys(params, []);
       const store = asRow(parseJson(await call(options, "/v2/store")));
       return {
-        id: store.id,
+        // `/v2/store` has no `store_hash` property. Its `id` *is* the store
+        // hash — "The store hash, a unique store identifier", a string — and
+        // `store_id` is the separate numeric ID. Reading `store_hash` here is
+        // what made this tool answer `null` to the one question it exists to
+        // answer: which store is this plugin pointed at.
+        storeHash: store.id ?? null,
+        storeId: store.store_id ?? null,
         name: store.name,
         domain: store.domain,
         secureUrl: store.secure_url ?? null,
@@ -472,7 +559,6 @@ export async function executeTool(
         timezone: asRow(store.timezone).name ?? null,
         language: store.language ?? null,
         plan: store.plan_name ?? null,
-        storeHash: store.store_hash ?? null,
         features: store.features ?? null,
       };
     }
@@ -507,11 +593,20 @@ export async function executeTool(
         "maxInventory",
         "modifiedSince",
         "sort",
+        "direction",
         "page",
         "limit",
       ]);
       const { page, limit } = paging(params);
       const sort = optionalString(params, "sort", 32);
+      // `/v3/catalog/products` takes the direction as its own parameter rather
+      // than as a `field:desc` suffix, so without this "newest first" is
+      // unreachable. `/v2/orders` is the other way round, which is why this
+      // tool's `sort` and list_orders' look different.
+      const direction = optionalString(params, "direction", 4);
+      if (direction !== undefined && !["asc", "desc"].includes(direction)) {
+        throw new InvalidParameterError('"direction" must be asc or desc.');
+      }
       if (
         sort !== undefined &&
         !["id", "name", "sku", "price", "date_modified", "inventory_level", "total_sold"].includes(
@@ -539,6 +634,7 @@ export async function executeTool(
           "inventory_level:max": formatNumber(optionalNumber(params, "maxInventory")),
           "date_modified:min": optionalTimestamp(params, "modifiedSince"),
           sort,
+          direction,
         }),
         page,
         limit,
@@ -587,48 +683,36 @@ export async function executeTool(
     case TOOL_NAMES.listCategories: {
       rejectUnknownKeys(params, ["treeId", "keyword", "parentId", "page", "limit"]);
       const { page, limit } = paging(params);
-      const requestedTree = optionalId(params, "treeId");
-      const filters = withFilters(pageQuery(page, limit), {
-        keyword: optionalString(params, "keyword", 200),
-        parent_id: formatId(optionalId(params, "parentId")),
-      });
 
-      // A store has one category tree per storefront channel. Asking for
-      // categories without naming a tree is the common case, so the tool
-      // discovers the trees rather than making the agent chain two calls — and
-      // reports which tree each category came from, because the same category
-      // name can exist in several.
-      // `/v3/catalog/trees` documents only `id:in` and `channel_id:in`, so it
-      // is called with no query at all rather than with paging parameters it
-      // never promised to accept. Trees are few; the cap is applied here.
-      const trees: Row[] =
-        requestedTree === undefined
-          ? (await v3List(options, "/v3/catalog/trees", {}, 1, CATEGORY_TREE_FAN_OUT_MAX)).rows
-          : [{ id: requestedTree, name: null }];
+      // `parentId: 0` is the top level of a tree, so this one ID filter has to
+      // accept 0 where every other ID in the plugin starts at 1.
+      const parentId = optionalInteger(params, "parentId", 0, Number.MAX_SAFE_INTEGER);
 
-      if (trees.length === 0) {
-        return { trees: [], note: "This store has no category trees." };
-      }
+      // The flat categories endpoint, not `/v3/catalog/trees/{tree_id}/categories`.
+      // That one returns a nested `CategoryNode` tree, documents only `depth`,
+      // carries no pagination and has none of the fields this tool reports —
+      // so reading it dropped every subcategory, ignored `keyword` and
+      // `parentId` without saying so, and fabricated `hasMore`. The flat
+      // endpoint answers every tree in one request with the filters the tool
+      // advertises. See README "Which categories endpoint".
+      const { rows, pagination } = await v3List(
+        options,
+        "/v3/catalog/trees/categories",
+        withFilters(pageQuery(page, limit), {
+          "tree_id:in": formatId(optionalId(params, "treeId")),
+          "parent_id:in": parentId === undefined ? undefined : String(parentId),
+          keyword: optionalString(params, "keyword", 200),
+        }),
+        page,
+        limit,
+      );
 
-      const results = [];
-      for (const tree of trees.slice(0, CATEGORY_TREE_FAN_OUT_MAX)) {
-        const treeId = tree.id;
-        if (typeof treeId !== "number") continue;
-        const { rows, pagination } = await v3List(
-          options,
-          `/v3/catalog/trees/${treeId}/categories`,
-          filters,
-          page,
-          limit,
-        );
-        results.push({
-          treeId,
-          treeName: tree.name ?? null,
-          pagination,
-          categories: rows.map((row) => summarizeCategory(row, treeId)),
-        });
-      }
-      return { trees: results };
+      // One extra call, not one per tree: `/v3/catalog/trees` names the trees
+      // so a row can say which storefront it belongs to. The same category
+      // name exists in several trees on a multi-storefront store, and a bare
+      // `tree_id` does not tell an agent which is which.
+      const treeNames = rows.length === 0 ? new Map() : await categoryTreeNames(options);
+      return { pagination, categories: rows.map((row) => summarizeCategory(row, treeNames)) };
     }
 
     case TOOL_NAMES.listBrands: {
@@ -704,7 +788,7 @@ export async function executeTool(
       const orderId = requiredId(params, "orderId");
       const order = parseJson(await call(options, `/v2/orders/${orderId}`));
       if (order === null) throw new BigCommerceError("BigCommerce has no such record.");
-      return order;
+      return summarizeOrderDetail(asRow(order));
     }
 
     case TOOL_NAMES.listOrderProducts: {
@@ -779,18 +863,59 @@ export async function executeTool(
         page,
         limit,
       );
+      // `/v3/inventory/items` nests: each row is `{ identity, locations[] }`,
+      // and the per-location numbers live under `locations[].settings` as well
+      // as on the location itself. Reading those eight fields off the top-level
+      // object returned a row of nothing but nulls for every item in the store.
+      // One output row per SKU/location pair, so `pagination` counts SKUs while
+      // `items` can be longer — a multi-location store has several rows per SKU.
       return {
         pagination,
-        items: rows.map((item) => ({
-          sku: item.sku ?? null,
-          productId: item.product_id ?? null,
-          variantId: item.variant_id ?? null,
-          locationId: item.location_id ?? null,
-          availableToSell: item.available_to_sell ?? null,
-          totalInventoryOnhand: item.total_inventory_onhand ?? null,
-          safetyStock: item.settings === undefined ? null : asRow(item.settings).safety_stock ?? null,
-          isInStockAlternate: item.is_in_stock_alternate ?? null,
-        })),
+        items: rows.flatMap((item) => {
+          const identity = asRow(item.identity);
+          const sku = { sku: identity.sku ?? null };
+          const ids = {
+            productId: identity.product_id ?? null,
+            variantId: identity.variant_id ?? null,
+          };
+          const locations = Array.isArray(item.locations) ? item.locations : [];
+          if (locations.length === 0) {
+            // An item with no location row has no stock numbers anywhere. Say
+            // that with one explicit row rather than dropping the SKU, so
+            // "which of these SKUs has no stock record" stays answerable.
+            return [
+              {
+                ...sku,
+                ...ids,
+                locationId: null,
+                locationCode: null,
+                locationName: null,
+                availableToSell: null,
+                totalInventoryOnhand: null,
+                qtyBackordered: null,
+                locationEnabled: null,
+                safetyStock: null,
+                isInStock: null,
+              },
+            ];
+          }
+          return locations.map(asRow).map((location) => {
+            const settings = asRow(location.settings);
+            return {
+              ...sku,
+              ...ids,
+              locationId: location.location_id ?? null,
+              locationCode: location.location_code ?? null,
+              locationName: location.location_name ?? null,
+              availableToSell: location.available_to_sell ?? null,
+              totalInventoryOnhand: location.total_inventory_onhand ?? null,
+              qtyBackordered: location.qty_backordered ?? null,
+              locationEnabled: location.location_enabled ?? null,
+              safetyStock: settings.safety_stock ?? null,
+              isInStock: settings.is_in_stock ?? null,
+            };
+          });
+        }),
       };
     }
 
@@ -801,7 +926,10 @@ export async function executeTool(
         options,
         "/v3/inventory/locations",
         withFilters(pageQuery(page, limit), {
-          "id:in": optionalIdList(params, "locationIds", 50),
+          // `location_id:in`, as `/v3/inventory/locations` documents it. A bare
+          // `id:in` is not a parameter of this endpoint, so it either widened
+          // the query to every location or made BigCommerce reject the call.
+          "location_id:in": optionalIdList(params, "locationIds", 50),
         }),
         page,
         limit,
@@ -824,6 +952,23 @@ export async function executeTool(
     default:
       throw new BigCommerceError(`Unknown BigCommerce tool: ${toolName}`);
   }
+}
+
+/**
+ * Map category tree IDs to their names.
+ *
+ * `/v3/catalog/trees` documents only `id:in` and `channel_id:in`, so it is
+ * called with no query at all rather than with paging parameters it never
+ * promised to accept. A store has one tree per storefront channel, so the
+ * whole list arrives in one page.
+ */
+async function categoryTreeNames(options: ClientOptions): Promise<Map<number, unknown>> {
+  const { rows } = await v3List(options, "/v3/catalog/trees", {}, 1, PAGE_LIMIT_DEFAULT);
+  const names = new Map<number, unknown>();
+  for (const tree of rows) {
+    if (typeof tree.id === "number") names.set(tree.id, tree.name ?? null);
+  }
+  return names;
 }
 
 function formatId(value: number | undefined): string | undefined {

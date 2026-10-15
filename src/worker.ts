@@ -123,11 +123,16 @@ const plugin = definePlugin({
   /**
    * Shape-only validation, and the "only" is deliberate.
    *
-   * The host calls this on start, on save, and behind the settings page's Test
-   * Connection button — but it passes the config without a company ID, and
-   * resolving the token ref requires one. So this cannot make a live request.
-   * It checks what it can and says plainly what it did not check, rather than
-   * reporting a green "connected" that was never tested.
+   * The host calls this from exactly one place: the settings page's Test
+   * Connection button. Saving the config does not call it — `POST
+   * /api/plugins/:id/config` validates against `instanceConfigSchema` with Ajv
+   * and nothing else — so anything that must block a save has to be expressible
+   * in that schema, and this function is a second opinion rather than a gate.
+   *
+   * It also cannot make a live request: the host passes the config without a
+   * company ID, and resolving the token ref requires one. So it checks what it
+   * can and says plainly what it did not check, rather than reporting a green
+   * "connected" that was never tested.
    */
   async onValidateConfig(
     config: Record<string, unknown>,

@@ -4,7 +4,15 @@
  * These drive {@link executeTool} with an injected fetch, so every assertion
  * is about the request this plugin actually builds from a tool's arguments and
  * the shape it hands back to the agent — not about a mocked-out helper.
+ *
+ * Response fixtures come from `openapi-fixtures.json`, whose every property
+ * name is checked against BigCommerce's published schemas by
+ * `openapi-contract.spec.ts`. That indirection is the point: a fixture written
+ * here by hand would be written in the shape this code expects, and the three
+ * endpoint defects QA found in the first version of this plugin all hid behind
+ * exactly that.
  */
+import { readFileSync } from "node:fs";
 import { beforeEach, describe, expect, it } from "vitest";
 import {
   bigCommerceApiOrigin,
@@ -48,6 +56,17 @@ function client(
 /** A v3 collection envelope. */
 function v3(data: unknown[], pagination?: Record<string, unknown>) {
   return { data, meta: { pagination: { total: data.length, total_pages: 1, ...pagination } } };
+}
+
+const FIXTURES = JSON.parse(
+  readFileSync(new URL("./openapi-fixtures.json", import.meta.url), "utf8"),
+) as { endpoints: Record<string, { source: string; body: unknown }> };
+
+/** The spec-shaped response body for one endpoint. */
+function fixture(path: string): unknown {
+  const body = FIXTURES.endpoints[path]?.body;
+  if (body === undefined) throw new Error(`No fixture for ${path}`);
+  return structuredClone(body);
 }
 
 function query(index = 0): Record<string, string> {
@@ -223,27 +242,11 @@ describe("status mapping", () => {
 
 describe("store info and catalog summary", () => {
   it("flattens the v2 store record into named fields", async () => {
-    const options = client([
-      {
-        body: {
-          id: 1,
-          name: "Brobston Supply",
-          domain: "shop.test",
-          secure_url: "https://shop.test",
-          currency: "USD",
-          currency_symbol: "$",
-          weight_units: "LBS",
-          dimension_units: "Inches",
-          timezone: { name: "America/Chicago", raw_offset: -21600 },
-          plan_name: "Standard",
-          store_hash: "abc123",
-        },
-      },
-    ]);
+    const options = client([{ body: fixture("/v2/store") }]);
     const result = await executeTool(options, TOOL_NAMES.getStoreInfo, {});
     expect(result).toMatchObject({
       name: "Brobston Supply",
-      domain: "shop.test",
+      domain: "shop.example.test",
       currency: "USD",
       weightUnits: "LBS",
       timezone: "America/Chicago",
@@ -252,21 +255,25 @@ describe("store info and catalog summary", () => {
     expect(calls[0]!.url.pathname).toBe("/stores/abc123/v2/store");
   });
 
+  /**
+   * `/v2/store` has no `store_hash` property: its `id` is the hash and
+   * `store_id` is the numeric ID. Reading `store_hash` made the one tool whose
+   * job is "say which store this is" answer `null`.
+   */
+  it("reads the hash from id and the numeric ID from store_id", async () => {
+    const options = client([{ body: fixture("/v2/store") }]);
+    const result = (await executeTool(options, TOOL_NAMES.getStoreInfo, {})) as Record<
+      string,
+      unknown
+    >;
+    expect(result.storeHash).toBe("abc123");
+    expect(result.storeId).toBe(123456);
+    // The ambiguous `id` is gone: one of these is a hash, the other a number.
+    expect(result).not.toHaveProperty("id");
+  });
+
   it("unwraps the v3 summary envelope", async () => {
-    const options = client([
-      {
-        body: {
-          data: {
-            inventory_count: 412,
-            variant_count: 980,
-            inventory_value: 51234.5,
-            lowest_variant_price: 3.5,
-            highest_variant_price: 899,
-            primary_category_name: "Shop All",
-          },
-        },
-      },
-    ]);
+    const options = client([{ body: fixture("/v3/catalog/summary") }]);
     expect(await executeTool(options, TOOL_NAMES.getCatalogSummary, {})).toMatchObject({
       inventoryCount: 412,
       variantCount: 980,
@@ -395,6 +402,22 @@ describe("list_products", () => {
     await expect(
       executeTool(options, TOOL_NAMES.listProducts, { sort: "total_revenue" }),
     ).rejects.toThrow(InvalidParameterError);
+  });
+
+  /**
+   * `/v3/catalog/products` takes the direction as its own parameter, so
+   * without it "the most recently changed products" is unreachable.
+   */
+  it("can sort descending", async () => {
+    const options = client([{ body: v3([]) }]);
+    await executeTool(options, TOOL_NAMES.listProducts, {
+      sort: "date_modified",
+      direction: "desc",
+    });
+    expect(query()).toMatchObject({ sort: "date_modified", direction: "desc" });
+    await expect(
+      executeTool(client([{ body: v3([]) }]), TOOL_NAMES.listProducts, { direction: "down" }),
+    ).rejects.toThrow(/"direction" must be asc or desc/);
   });
 });
 
@@ -568,12 +591,54 @@ describe("orders", () => {
     });
   });
 
-  it("returns the full record for one order", async () => {
-    const options = client([{ body: { id: 1042, billing_address: { city: "Dallas" } } }]);
-    expect(await executeTool(options, TOOL_NAMES.getOrder, { orderId: 1042 })).toMatchObject({
-      id: 1042,
-    });
+  it("returns one order's detail, including the billing address", async () => {
+    const options = client([{ body: fixture("/v2/orders/{order_id}") }]);
+    const result = (await executeTool(options, TOOL_NAMES.getOrder, { orderId: 1042 })) as Record<
+      string,
+      unknown
+    >;
     expect(calls[0]!.url.pathname).toBe("/stores/abc123/v2/orders/1042");
+    expect(result).toMatchObject({
+      id: 1042,
+      status: "Shipped",
+      statusId: 2,
+      customerId: 55,
+      customerMessage: "Please leave at the loading dock.",
+      totalIncTax: "128.4000",
+      paymentStatus: "captured",
+      shippingAddressCount: 1,
+    });
+    expect(result.billingAddress).toEqual({
+      firstName: "Ada",
+      lastName: "Byron",
+      company: "Analytical Engines",
+      street1: "1 Analytical Way",
+      street2: "Suite 2",
+      city: "Dallas",
+      state: "Texas",
+      zip: "75201",
+      country: "United States",
+      countryIso2: "US",
+      email: "buyer@example.test",
+      phone: "555-0100",
+    });
+  });
+
+  /**
+   * Every other tool returns an allowlisted row. This one used to return the
+   * upstream record whole, which made its PII surface whatever BigCommerce
+   * sends — the shopper's IP address included — and whatever they add next.
+   */
+  it("allowlists the order record rather than passing it through", async () => {
+    const options = client([{ body: fixture("/v2/orders/{order_id}") }]);
+    const result = await executeTool(options, TOOL_NAMES.getOrder, { orderId: 1042 });
+    const serialized = JSON.stringify(result);
+    expect(serialized).not.toContain("203.0.113.42");
+    expect(serialized).not.toContain("2001:db8::2a");
+    // Internal notes and the raw sub-resource links stay upstream too.
+    expect(serialized).not.toContain("Called the customer");
+    expect(result).not.toHaveProperty("products");
+    expect(result).not.toHaveProperty("payment_provider_id");
   });
 
   it("treats a 204 on a single order as not found", async () => {
@@ -615,73 +680,121 @@ describe("orders", () => {
 });
 
 describe("categories", () => {
-  it("discovers the trees when none is named and tags each category", async () => {
-    const options = client([
-      { body: v3([{ id: 1, name: "Storefront" }, { id: 2, name: "Wholesale" }]) },
-      { body: v3([{ category_id: 23, parent_id: 0, name: "Tools", is_visible: true }]) },
-      { body: v3([{ category_id: 31, parent_id: 0, name: "Bulk", is_visible: false }]) },
+  /** The flat endpoint, then one call to name the trees. */
+  function categoryClient() {
+    return client([
+      { body: fixture("/v3/catalog/trees/categories") },
+      { body: fixture("/v3/catalog/trees") },
     ]);
-    const result = (await executeTool(options, TOOL_NAMES.listCategories, {})) as {
-      trees: Array<{ treeId: number; treeName: string; categories: Array<Record<string, unknown>> }>;
+  }
+
+  /**
+   * The nested endpoint `/v3/catalog/trees/{tree_id}/categories` returns a
+   * `CategoryNode` tree: every subcategory lives in a `children[]` array the
+   * mapper never walked, so reading it returned the root level only and called
+   * that the store's categories.
+   */
+  it("returns every level of the hierarchy, not just the roots", async () => {
+    const result = (await executeTool(categoryClient(), TOOL_NAMES.listCategories, {})) as {
+      categories: Array<Record<string, unknown>>;
     };
-    expect(calls.map((call) => call.url.pathname)).toEqual([
-      "/stores/abc123/v3/catalog/trees",
-      "/stores/abc123/v3/catalog/trees/1/categories",
-      "/stores/abc123/v3/catalog/trees/2/categories",
+    expect(calls[0]!.url.pathname).toBe("/stores/abc123/v3/catalog/trees/categories");
+    expect(result.categories.map((category) => category.name)).toEqual([
+      "Tools",
+      "Wrenches",
+      "Pipe Wrenches",
+      "Bulk",
     ]);
-    expect(result.trees.map((tree) => tree.treeName)).toEqual(["Storefront", "Wholesale"]);
-    // The same category name can exist in several trees, so each row says
-    // which tree it came from.
-    expect(result.trees[0]!.categories[0]).toMatchObject({ id: 23, treeId: 1, name: "Tools" });
-    expect(result.trees[1]!.categories[0]).toMatchObject({ id: 31, treeId: 2 });
+    // parentId on each row is what makes the hierarchy reconstructable.
+    expect(result.categories.map((category) => category.parentId)).toEqual([0, 23, 31, 0]);
+  });
+
+  it("reads the flat endpoint's own field names, including sort order", async () => {
+    const result = (await executeTool(categoryClient(), TOOL_NAMES.listCategories, {})) as {
+      categories: Array<Record<string, unknown>>;
+    };
+    expect(result.categories[1]).toEqual({
+      id: 31,
+      treeId: 1,
+      treeName: "Storefront",
+      parentId: 23,
+      name: "Wrenches",
+      isVisible: true,
+      sortOrder: 2,
+    });
+  });
+
+  /** The same category name exists in several trees on a multi-storefront store. */
+  it("names the tree each category belongs to", async () => {
+    const result = (await executeTool(categoryClient(), TOOL_NAMES.listCategories, {})) as {
+      categories: Array<Record<string, unknown>>;
+    };
+    expect(calls[1]!.url.pathname).toBe("/stores/abc123/v3/catalog/trees");
+    expect(result.categories.at(-1)).toMatchObject({ treeId: 2, treeName: "Wholesale" });
   });
 
   it("sends no paging parameters to the trees endpoint", async () => {
     // `/v3/catalog/trees` documents only `id:in` and `channel_id:in`.
-    const options = client([{ body: v3([]) }]);
-    await executeTool(options, TOOL_NAMES.listCategories, {});
-    expect([...calls[0]!.url.searchParams.keys()]).toEqual([]);
+    await executeTool(categoryClient(), TOOL_NAMES.listCategories, {});
+    expect([...calls[1]!.url.searchParams.keys()]).toEqual([]);
   });
 
-  it("skips tree discovery when a tree is named", async () => {
-    const options = client([{ body: v3([{ category_id: 23, name: "Tools" }]) }]);
+  it("translates its filters into the flat endpoint's query names", async () => {
+    const options = categoryClient();
     await executeTool(options, TOOL_NAMES.listCategories, {
       treeId: 2,
-      keyword: "tool",
-      parentId: 5,
+      keyword: "wrench",
+      parentId: 23,
+      limit: 25,
     });
-    expect(calls).toHaveLength(1);
-    expect(calls[0]!.url.pathname).toBe("/stores/abc123/v3/catalog/trees/2/categories");
-    expect(query()).toMatchObject({ keyword: "tool", parent_id: "5" });
+    expect(query()).toMatchObject({
+      "tree_id:in": "2",
+      "parent_id:in": "23",
+      keyword: "wrench",
+      page: "1",
+      limit: "25",
+    });
   });
 
-  it("says so plainly when the store has no trees", async () => {
-    const options = client([{ body: v3([]) }]);
-    expect(await executeTool(options, TOOL_NAMES.listCategories, {})).toMatchObject({
-      trees: [],
-      note: expect.stringContaining("no category trees"),
+  /** The top level of a tree is `parent_id` 0, so this filter has to allow it. */
+  it("accepts parentId 0 for the top-level categories", async () => {
+    await executeTool(categoryClient(), TOOL_NAMES.listCategories, { parentId: 0 });
+    expect(query()["parent_id:in"]).toBe("0");
+  });
+
+  it("reports the API's real pagination instead of inferring it", async () => {
+    const options = client([
+      { body: v3([{ category_id: 1, tree_id: 1, name: "One" }], { total: 9, total_pages: 3 }) },
+      { body: fixture("/v3/catalog/trees") },
+    ]);
+    const result = (await executeTool(options, TOOL_NAMES.listCategories, { limit: 1 })) as {
+      pagination: Record<string, unknown>;
+    };
+    // The nested endpoint carries no pagination at all, which is what made
+    // hasMore say "true" forever while `page` was ignored.
+    expect(result.pagination).toEqual({
+      page: 1,
+      limit: 1,
+      returned: 1,
+      total: 9,
+      totalPages: 3,
+      hasMore: true,
     });
+  });
+
+  it("does not ask for tree names when there are no categories to name", async () => {
+    const options = client([{ body: v3([]) }]);
+    const result = (await executeTool(options, TOOL_NAMES.listCategories, {
+      keyword: "nothing",
+    })) as { categories: unknown[] };
+    expect(result.categories).toEqual([]);
+    expect(calls).toHaveLength(1);
   });
 });
 
 describe("customers and inventory", () => {
   it("maps customer filters and returns compact rows", async () => {
-    const options = client([
-      {
-        body: v3([
-          {
-            id: 55,
-            email: "buyer@example.test",
-            first_name: "Ada",
-            last_name: "Byron",
-            company: "Analytical",
-            phone: "555-0100",
-            customer_group_id: 2,
-            date_created: "2026-01-02T00:00:00Z",
-          },
-        ]),
-      },
-    ]);
+    const options = client([{ body: fixture("/v3/customers") }]);
     const result = (await executeTool(options, TOOL_NAMES.listCustomers, {
       email: "buyer@example.test",
       name: "Ada",
@@ -696,68 +809,122 @@ describe("customers and inventory", () => {
       "customer_group_id:in": "2",
       "date_created:min": "2026-01-01T00:00:00.000Z",
     });
-    expect(result.customers[0]).toMatchObject({ id: 55, email: "buyer@example.test", company: "Analytical" });
+    expect(result.customers[0]).toEqual({
+      id: 55,
+      email: "buyer@example.test",
+      firstName: "Ada",
+      lastName: "Byron",
+      company: "Analytical Engines",
+      customerGroupId: 2,
+      dateCreated: "2026-01-02T00:00:00Z",
+    });
   });
 
-  it("reads per-location stock, including safety stock from settings", async () => {
-    const options = client([
-      {
-        body: v3([
-          {
-            sku: "PW-14",
-            product_id: 42,
-            variant_id: 77,
-            location_id: 1,
-            available_to_sell: 4,
-            total_inventory_onhand: 6,
-            settings: { safety_stock: 2 },
-          },
-        ]),
-      },
-    ]);
+  /**
+   * The job is resolving an email to a customer ID. Everything an agent reads
+   * lands in a run transcript, so the row carries no contact detail the job
+   * does not need — and the upstream record's notes and IP stay upstream.
+   */
+  it("leaves the phone number, notes and registration IP behind", async () => {
+    const options = client([{ body: fixture("/v3/customers") }]);
+    const result = (await executeTool(options, TOOL_NAMES.listCustomers, {})) as {
+      customers: Array<Record<string, unknown>>;
+    };
+    const serialized = JSON.stringify(result);
+    expect(serialized).not.toContain("555-0100");
+    expect(serialized).not.toContain("203.0.113.42");
+    expect(serialized).not.toContain("Net 30");
+  });
+
+  /**
+   * `/v3/inventory/items` answers `{ identity, locations[] }`, and the stock
+   * numbers live on each location with safety stock under `settings`. Reading
+   * them off the top-level object returned one row per item in which every
+   * value was null.
+   */
+  it("flat-maps each item's locations into rows with real numbers", async () => {
+    const options = client([{ body: fixture("/v3/inventory/items") }]);
     const result = (await executeTool(options, TOOL_NAMES.listInventory, {
-      skus: ["PW-14"],
-      locationIds: [1],
-    })) as { items: Array<Record<string, unknown>> };
-    expect(query()).toMatchObject({ "sku:in": "PW-14", "location_id:in": "1" });
-    expect(result.items[0]).toMatchObject({
-      sku: "PW-14",
+      skus: ["PW-14-RED"],
+      locationIds: [1, 2],
+    })) as { items: Array<Record<string, unknown>>; pagination: { returned: number } };
+    expect(query()).toMatchObject({ "sku:in": "PW-14-RED", "location_id:in": "1,2" });
+    expect(result.items[0]).toEqual({
+      sku: "PW-14-RED",
+      productId: 42,
+      variantId: 77,
+      locationId: 1,
+      locationCode: "DAL",
+      locationName: "Dallas Warehouse",
       availableToSell: 4,
       totalInventoryOnhand: 6,
+      qtyBackordered: 0,
+      locationEnabled: true,
       safetyStock: 2,
+      isInStock: true,
+    });
+    // Two SKUs, three SKU/location pairs: pagination counts the SKUs the API
+    // paged over, `items` carries one row per place the SKU is stocked.
+    expect(result.items).toHaveLength(3);
+    expect(result.pagination.returned).toBe(2);
+    expect(result.items[1]).toMatchObject({
+      sku: "PW-14-RED",
+      locationId: 2,
+      availableToSell: 0,
+      qtyBackordered: 3,
+      isInStock: false,
+    });
+    expect(result.items[2]).toMatchObject({ sku: "PW-18", locationId: 1, availableToSell: 11 });
+  });
+
+  /** `is_in_stock_alternate` exists nowhere in BigCommerce's schema. */
+  it("reports in-stock status from the location's settings", async () => {
+    const options = client([{ body: fixture("/v3/inventory/items") }]);
+    const result = (await executeTool(options, TOOL_NAMES.listInventory, {})) as {
+      items: Array<Record<string, unknown>>;
+    };
+    expect(result.items[0]).not.toHaveProperty("isInStockAlternate");
+    expect(result.items[0]!.isInStock).toBe(true);
+  });
+
+  it("keeps a SKU that has no location row at all", async () => {
+    const options = client([
+      { body: v3([{ identity: { sku: "GHOST-1", product_id: 9 }, locations: [] }]) },
+    ]);
+    const result = (await executeTool(options, TOOL_NAMES.listInventory, {})) as {
+      items: Array<Record<string, unknown>>;
+    };
+    // Dropping it would make "which SKUs have no stock record" unanswerable.
+    expect(result.items).toHaveLength(1);
+    expect(result.items[0]).toMatchObject({
+      sku: "GHOST-1",
+      locationId: null,
+      availableToSell: null,
     });
   });
 
   it("names locations so an ID can be turned back into a place", async () => {
-    const options = client([
-      {
-        body: v3([
-          {
-            id: 1,
-            code: "DAL",
-            label: "Dallas Warehouse",
-            enabled: true,
-            time_zone: "America/Chicago",
-            address: { city: "Dallas", country_code: "US" },
-          },
-        ]),
-      },
-    ]);
-    const result = (await executeTool(options, TOOL_NAMES.listLocations, {})) as {
-      locations: Array<Record<string, unknown>>;
-    };
+    const options = client([{ body: fixture("/v3/inventory/locations") }]);
+    const result = (await executeTool(options, TOOL_NAMES.listLocations, {
+      locationIds: [1, 2],
+    })) as { locations: Array<Record<string, unknown>> };
+    // `/v3/inventory/locations` documents `location_id:in`; there is no bare
+    // `id:in`, so the old filter either widened the query or 422'd.
+    expect(query()["location_id:in"]).toBe("1,2");
+    expect(query()["id:in"]).toBeUndefined();
     expect(result.locations[0]).toMatchObject({
       id: 1,
       code: "DAL",
       label: "Dallas Warehouse",
+      enabled: true,
+      timeZone: "America/Chicago",
       city: "Dallas",
+      countryCode: "USA",
     });
   });
 
   it("lists brands with their storefront URL", async () => {
-    const options = client([
-      { body: v3([{ id: 3, name: "Ridgid", custom_url: { url: "/ridgid/" } }]) },
-    ]);
+    const options = client([{ body: fixture("/v3/catalog/brands") }]);
     const result = (await executeTool(options, TOOL_NAMES.listBrands, { name: "Ridgid" })) as {
       brands: Array<Record<string, unknown>>;
     };
@@ -766,13 +933,13 @@ describe("customers and inventory", () => {
   });
 
   it("returns variants under the product they belong to", async () => {
-    const options = client([{ body: v3([{ id: 77, sku: "PW-14-RED", price: 26 }]) }]);
+    const options = client([{ body: fixture("/v3/catalog/products/{product_id}/variants") }]);
     const result = (await executeTool(options, TOOL_NAMES.listProductVariants, {
       productId: 42,
-    })) as { productId: number; variants: unknown[] };
+    })) as { productId: number; variants: Array<Record<string, unknown>> };
     expect(calls[0]!.url.pathname).toBe("/stores/abc123/v3/catalog/products/42/variants");
     expect(result.productId).toBe(42);
-    expect(result.variants).toHaveLength(1);
+    expect(result.variants[0]).toMatchObject({ id: 77, sku: "PW-14-RED", price: 26 });
   });
 });
 

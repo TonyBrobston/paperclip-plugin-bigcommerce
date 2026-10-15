@@ -156,11 +156,15 @@ describe("instance config schema", () => {
       expect(withOrigin("")).toBe(true);
     });
 
-    it.each([
+    const ACCEPTED = [
       ["the default origin", "https://api.bigcommerce.com"],
       ["an origin pasted with a trailing slash", "https://api.bigcommerce.com/"],
-      ["a loopback mock", "http://127.0.0.1:8080"],
-    ])("accepts %s", (_label, origin) => {
+      ["an IPv4 loopback mock", "http://127.0.0.1:8080"],
+      ["a localhost mock", "http://localhost:3000"],
+      ["an IPv6 loopback mock", "http://[::1]:3000"],
+    ] as const;
+
+    it.each(ACCEPTED)("accepts %s", (_label, origin) => {
       expect(withOrigin(origin)).toBe(true);
     });
 
@@ -173,30 +177,42 @@ describe("instance config schema", () => {
     ])("rejects %s", (_label, origin) => {
       expect(withOrigin(origin)).toBe(false);
     });
+
+    /**
+     * This pattern has to carry the https restriction itself. The worker's
+     * `onValidateConfig` rejects plaintext too, but the host calls that from
+     * one place only — the settings page's Test Connection button. A save runs
+     * Ajv against this schema and nothing else, so without the restriction here
+     * `http://api.bigcommerce.com` saved green and then failed every tool call:
+     * a dead config rather than a refused one.
+     */
+    it.each([
+      ["plain http to the real API", "http://api.bigcommerce.com"],
+      ["plain http to a LAN host", "http://10.0.0.5"],
+      ["plain http to a hostname that merely starts with localhost", "http://localhost.evil.test"],
+      ["plain http to a non-loopback 127-lookalike", "http://127.0.0.1.evil.test"],
+    ])("rejects %s at save, not at request time", (_label, origin) => {
+      expect(withOrigin(origin)).toBe(false);
+    });
+
+    /**
+     * The schema and the request builder are separate guards on the same value,
+     * and the builder is the one that runs on stored config that may predate
+     * the field. They have to agree in both directions: anything the form
+     * accepts must survive the builder, and anything the builder refuses must
+     * never have been savable.
+     */
+    it.each(ACCEPTED)("agrees with the request builder about %s", (_label, origin) => {
+      expect(bigCommerceApiOrigin(origin)).toBe(origin.replace(/\/+$/, ""));
+    });
   });
 
-  /**
-   * The schema and the request builder are separate guards on the same values,
-   * and the builder is the one that runs on stored config that may predate the
-   * field. Anything the form accepts has to survive the builder, or the save
-   * succeeds and every tool call then fails.
-   *
-   * The reverse is deliberately not true for `apiOrigin`: the form's pattern
-   * allows any http host and the builder narrows http to loopback, because a
-   * regex cannot express "loopback" and a save that silently sent a long-lived
-   * credential in plaintext would be worse than one the worker refuses with a
-   * reason.
-   */
   it("accepts only configuration the request builder can use", () => {
     for (const storeHash of ["abc123xyz", "Abc123XYZ", "1234567890"]) {
       expect(withStoreHash(storeHash)).toBe(true);
       expect(bigCommerceUrl({ storeHash, accessToken: "t" }, "/v2/store").pathname).toBe(
         `/stores/${storeHash}/v2/store`,
       );
-    }
-    for (const origin of ["https://api.bigcommerce.com", "https://api.bigcommerce.com/", "http://127.0.0.1:8080"]) {
-      expect(withOrigin(origin)).toBe(true);
-      expect(() => bigCommerceApiOrigin(origin)).not.toThrow();
     }
   });
 });

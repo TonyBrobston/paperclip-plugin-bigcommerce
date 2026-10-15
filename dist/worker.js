@@ -42059,7 +42059,6 @@ var TOOL_NAMES = {
 var PAGE_LIMIT_MAX = 250;
 var PAGE_LIMIT_DEFAULT = 50;
 var PAGE_MAX = 1e3;
-var CATEGORY_TREE_FAN_OUT_MAX = 5;
 var RESPONSE_LIMIT_BYTES = 8 * 1024 * 1024;
 var REQUEST_TIMEOUT_MS = 3e4;
 var CONFIG_KEYS = {
@@ -42415,19 +42414,72 @@ function summarizeCustomer(customer) {
     firstName: customer.first_name ?? null,
     lastName: customer.last_name ?? null,
     company: customer.company ?? null,
-    phone: customer.phone ?? null,
     customerGroupId: customer.customer_group_id ?? null,
     dateCreated: customer.date_created ?? null
   };
 }
-function summarizeCategory(category, treeId) {
+function summarizeCategory(category, treeNames) {
+  const treeId = category.tree_id ?? null;
   return {
-    id: category.category_id ?? category.id,
+    id: category.category_id ?? null,
     treeId,
+    treeName: typeof treeId === "number" ? treeNames.get(treeId) ?? null : null,
     parentId: category.parent_id ?? null,
     name: category.name,
     isVisible: category.is_visible ?? null,
     sortOrder: category.sort_order ?? null
+  };
+}
+function summarizeOrderDetail(order) {
+  const billing = asRow(order.billing_address);
+  return {
+    id: order.id,
+    status: order.status,
+    statusId: order.status_id,
+    orderSource: order.order_source ?? null,
+    channelId: order.channel_id ?? null,
+    isDeleted: order.is_deleted ?? null,
+    dateCreated: order.date_created,
+    dateModified: order.date_modified ?? null,
+    dateShipped: order.date_shipped ?? null,
+    customerId: order.customer_id,
+    customerMessage: order.customer_message ?? null,
+    itemsTotal: order.items_total ?? null,
+    itemsShipped: order.items_shipped ?? null,
+    orderIsDigital: order.order_is_digital ?? null,
+    currencyCode: order.currency_code ?? null,
+    currencyExchangeRate: order.currency_exchange_rate ?? null,
+    subtotalExTax: order.subtotal_ex_tax ?? null,
+    subtotalIncTax: order.subtotal_inc_tax ?? null,
+    discountAmount: order.discount_amount ?? null,
+    couponDiscount: order.coupon_discount ?? null,
+    shippingCostExTax: order.shipping_cost_ex_tax ?? null,
+    shippingCostIncTax: order.shipping_cost_inc_tax ?? null,
+    handlingCostIncTax: order.handling_cost_inc_tax ?? null,
+    wrappingCostIncTax: order.wrapping_cost_inc_tax ?? null,
+    totalExTax: order.total_ex_tax ?? null,
+    totalIncTax: order.total_inc_tax ?? null,
+    totalTax: order.total_tax ?? null,
+    refundedAmount: order.refunded_amount ?? null,
+    storeCreditAmount: order.store_credit_amount ?? null,
+    giftCertificateAmount: order.gift_certificate_amount ?? null,
+    paymentMethod: order.payment_method ?? null,
+    paymentStatus: order.payment_status ?? null,
+    shippingAddressCount: order.shipping_address_count ?? null,
+    billingAddress: {
+      firstName: billing.first_name ?? null,
+      lastName: billing.last_name ?? null,
+      company: billing.company ?? null,
+      street1: billing.street_1 ?? null,
+      street2: billing.street_2 ?? null,
+      city: billing.city ?? null,
+      state: billing.state ?? null,
+      zip: billing.zip ?? null,
+      country: billing.country ?? null,
+      countryIso2: billing.country_iso2 ?? null,
+      email: billing.email ?? null,
+      phone: billing.phone ?? null
+    }
   };
 }
 async function executeTool(options, toolName, parameters) {
@@ -42437,7 +42489,13 @@ async function executeTool(options, toolName, parameters) {
       rejectUnknownKeys(params, []);
       const store = asRow(parseJson(await call(options, "/v2/store")));
       return {
-        id: store.id,
+        // `/v2/store` has no `store_hash` property. Its `id` *is* the store
+        // hash — "The store hash, a unique store identifier", a string — and
+        // `store_id` is the separate numeric ID. Reading `store_hash` here is
+        // what made this tool answer `null` to the one question it exists to
+        // answer: which store is this plugin pointed at.
+        storeHash: store.id ?? null,
+        storeId: store.store_id ?? null,
         name: store.name,
         domain: store.domain,
         secureUrl: store.secure_url ?? null,
@@ -42449,7 +42507,6 @@ async function executeTool(options, toolName, parameters) {
         timezone: asRow(store.timezone).name ?? null,
         language: store.language ?? null,
         plan: store.plan_name ?? null,
-        storeHash: store.store_hash ?? null,
         features: store.features ?? null
       };
     }
@@ -42482,11 +42539,16 @@ async function executeTool(options, toolName, parameters) {
         "maxInventory",
         "modifiedSince",
         "sort",
+        "direction",
         "page",
         "limit"
       ]);
       const { page: page2, limit } = paging(params);
       const sort = optionalString(params, "sort", 32);
+      const direction = optionalString(params, "direction", 4);
+      if (direction !== void 0 && !["asc", "desc"].includes(direction)) {
+        throw new InvalidParameterError('"direction" must be asc or desc.');
+      }
       if (sort !== void 0 && !["id", "name", "sku", "price", "date_modified", "inventory_level", "total_sold"].includes(
         sort
       )) {
@@ -42510,7 +42572,8 @@ async function executeTool(options, toolName, parameters) {
           "inventory_level:min": formatNumber(optionalNumber(params, "minInventory")),
           "inventory_level:max": formatNumber(optionalNumber(params, "maxInventory")),
           "date_modified:min": optionalTimestamp(params, "modifiedSince"),
-          sort
+          sort,
+          direction
         }),
         page2,
         limit
@@ -42556,34 +42619,20 @@ async function executeTool(options, toolName, parameters) {
     case TOOL_NAMES.listCategories: {
       rejectUnknownKeys(params, ["treeId", "keyword", "parentId", "page", "limit"]);
       const { page: page2, limit } = paging(params);
-      const requestedTree = optionalId(params, "treeId");
-      const filters = withFilters(pageQuery(page2, limit), {
-        keyword: optionalString(params, "keyword", 200),
-        parent_id: formatId(optionalId(params, "parentId"))
-      });
-      const trees = requestedTree === void 0 ? (await v3List(options, "/v3/catalog/trees", {}, 1, CATEGORY_TREE_FAN_OUT_MAX)).rows : [{ id: requestedTree, name: null }];
-      if (trees.length === 0) {
-        return { trees: [], note: "This store has no category trees." };
-      }
-      const results = [];
-      for (const tree of trees.slice(0, CATEGORY_TREE_FAN_OUT_MAX)) {
-        const treeId = tree.id;
-        if (typeof treeId !== "number") continue;
-        const { rows, pagination } = await v3List(
-          options,
-          `/v3/catalog/trees/${treeId}/categories`,
-          filters,
-          page2,
-          limit
-        );
-        results.push({
-          treeId,
-          treeName: tree.name ?? null,
-          pagination,
-          categories: rows.map((row) => summarizeCategory(row, treeId))
-        });
-      }
-      return { trees: results };
+      const parentId = optionalInteger(params, "parentId", 0, Number.MAX_SAFE_INTEGER);
+      const { rows, pagination } = await v3List(
+        options,
+        "/v3/catalog/trees/categories",
+        withFilters(pageQuery(page2, limit), {
+          "tree_id:in": formatId(optionalId(params, "treeId")),
+          "parent_id:in": parentId === void 0 ? void 0 : String(parentId),
+          keyword: optionalString(params, "keyword", 200)
+        }),
+        page2,
+        limit
+      );
+      const treeNames = rows.length === 0 ? /* @__PURE__ */ new Map() : await categoryTreeNames(options);
+      return { pagination, categories: rows.map((row) => summarizeCategory(row, treeNames)) };
     }
     case TOOL_NAMES.listBrands: {
       rejectUnknownKeys(params, ["name", "page", "limit"]);
@@ -42653,7 +42702,7 @@ async function executeTool(options, toolName, parameters) {
       const orderId = requiredId(params, "orderId");
       const order = parseJson(await call(options, `/v2/orders/${orderId}`));
       if (order === null) throw new BigCommerceError("BigCommerce has no such record.");
-      return order;
+      return summarizeOrderDetail(asRow(order));
     }
     case TOOL_NAMES.listOrderProducts: {
       rejectUnknownKeys(params, ["orderId", "page", "limit"]);
@@ -42727,16 +42776,48 @@ async function executeTool(options, toolName, parameters) {
       );
       return {
         pagination,
-        items: rows.map((item) => ({
-          sku: item.sku ?? null,
-          productId: item.product_id ?? null,
-          variantId: item.variant_id ?? null,
-          locationId: item.location_id ?? null,
-          availableToSell: item.available_to_sell ?? null,
-          totalInventoryOnhand: item.total_inventory_onhand ?? null,
-          safetyStock: item.settings === void 0 ? null : asRow(item.settings).safety_stock ?? null,
-          isInStockAlternate: item.is_in_stock_alternate ?? null
-        }))
+        items: rows.flatMap((item) => {
+          const identity = asRow(item.identity);
+          const sku = { sku: identity.sku ?? null };
+          const ids = {
+            productId: identity.product_id ?? null,
+            variantId: identity.variant_id ?? null
+          };
+          const locations = Array.isArray(item.locations) ? item.locations : [];
+          if (locations.length === 0) {
+            return [
+              {
+                ...sku,
+                ...ids,
+                locationId: null,
+                locationCode: null,
+                locationName: null,
+                availableToSell: null,
+                totalInventoryOnhand: null,
+                qtyBackordered: null,
+                locationEnabled: null,
+                safetyStock: null,
+                isInStock: null
+              }
+            ];
+          }
+          return locations.map(asRow).map((location) => {
+            const settings = asRow(location.settings);
+            return {
+              ...sku,
+              ...ids,
+              locationId: location.location_id ?? null,
+              locationCode: location.location_code ?? null,
+              locationName: location.location_name ?? null,
+              availableToSell: location.available_to_sell ?? null,
+              totalInventoryOnhand: location.total_inventory_onhand ?? null,
+              qtyBackordered: location.qty_backordered ?? null,
+              locationEnabled: location.location_enabled ?? null,
+              safetyStock: settings.safety_stock ?? null,
+              isInStock: settings.is_in_stock ?? null
+            };
+          });
+        })
       };
     }
     case TOOL_NAMES.listLocations: {
@@ -42746,7 +42827,10 @@ async function executeTool(options, toolName, parameters) {
         options,
         "/v3/inventory/locations",
         withFilters(pageQuery(page2, limit), {
-          "id:in": optionalIdList(params, "locationIds", 50)
+          // `location_id:in`, as `/v3/inventory/locations` documents it. A bare
+          // `id:in` is not a parameter of this endpoint, so it either widened
+          // the query to every location or made BigCommerce reject the call.
+          "location_id:in": optionalIdList(params, "locationIds", 50)
         }),
         page2,
         limit
@@ -42768,6 +42852,14 @@ async function executeTool(options, toolName, parameters) {
     default:
       throw new BigCommerceError(`Unknown BigCommerce tool: ${toolName}`);
   }
+}
+async function categoryTreeNames(options) {
+  const { rows } = await v3List(options, "/v3/catalog/trees", {}, 1, PAGE_LIMIT_DEFAULT);
+  const names = /* @__PURE__ */ new Map();
+  for (const tree of rows) {
+    if (typeof tree.id === "number") names.set(tree.id, tree.name ?? null);
+  }
+  return names;
 }
 function formatId(value) {
   return value === void 0 ? void 0 : String(value);
@@ -42848,7 +42940,7 @@ var TOOL_DECLARATIONS = [
   {
     name: TOOL_NAMES.getStoreInfo,
     displayName: "BigCommerce: get store info",
-    description: "Get the store's identity and settings: name, domain, status, currency, weight and dimension units, time zone and plan. Start here to confirm which store this plugin is pointed at and what currency and units the other tools' numbers are in.",
+    description: "Get the store's identity and settings: store hash and numeric ID, name, domain, status, currency, weight and dimension units, time zone and plan. Start here to confirm which store this plugin is pointed at and what currency and units the other tools' numbers are in.",
     parametersSchema: object2({})
   },
   {
@@ -42889,6 +42981,11 @@ var TOOL_DECLARATIONS = [
         type: "string",
         enum: ["id", "name", "sku", "price", "date_modified", "inventory_level", "total_sold"],
         description: "Field to sort by."
+      },
+      direction: {
+        type: "string",
+        enum: ["asc", "desc"],
+        description: "Sort direction (default asc). Use sort=date_modified with direction=desc for the most recently changed products."
       },
       ...paging2
     })
@@ -42936,7 +43033,7 @@ var TOOL_DECLARATIONS = [
   {
     name: TOOL_NAMES.listCategories,
     displayName: "BigCommerce: list categories",
-    description: "List storefront categories with their parent IDs, so the category hierarchy can be reconstructed. With no tree ID it lists categories for every category tree in the store and tags each with the tree it came from.",
+    description: "List storefront categories \u2014 every level, not just the top \u2014 with their parent IDs, so the hierarchy can be reconstructed. Each row says which category tree it came from, because a multi-storefront store has one tree per storefront and the same category name can exist in several.",
     parametersSchema: object2({
       treeId: {
         type: "integer",
@@ -42950,8 +43047,8 @@ var TOOL_DECLARATIONS = [
       },
       parentId: {
         type: "integer",
-        minimum: 1,
-        description: "Only direct children of this category."
+        minimum: 0,
+        description: "Only direct children of this category. Use 0 for the top-level categories of a tree."
       },
       ...paging2
     })
@@ -43013,7 +43110,7 @@ var TOOL_DECLARATIONS = [
   {
     name: TOOL_NAMES.getOrder,
     displayName: "BigCommerce: get order",
-    description: "Get one order's full record: status and status history fields, every money field, payment and shipping details, and the billing address. Contains customer personal data \u2014 see the plugin README.",
+    description: "Get one order's detail: status, dates, every money field, payment method and status, the shopper's order message, and the billing address. The shopper's IP address and the merchant's internal staff notes are deliberately not returned. Contains customer personal data \u2014 see the plugin README.",
     parametersSchema: object2(
       { orderId: { type: "integer", minimum: 1, description: "The order's ID." } },
       ["orderId"]
@@ -43034,7 +43131,7 @@ var TOOL_DECLARATIONS = [
   {
     name: TOOL_NAMES.listCustomers,
     displayName: "BigCommerce: list customers",
-    description: "Search and list customer accounts, returning a compact row per customer (ID, email, name, company, group). Use this to resolve an email into the `customerId` that list_orders filters on. Contains customer personal data \u2014 see the plugin README.",
+    description: "Search and list customer accounts, returning a compact row per customer (ID, email, name, company, group, signup date). Use this to resolve an email into the `customerId` that list_orders filters on. Contains customer personal data \u2014 see the plugin README.",
     parametersSchema: object2({
       email: {
         type: "string",
@@ -43063,7 +43160,7 @@ var TOOL_DECLARATIONS = [
   {
     name: TOOL_NAMES.listInventory,
     displayName: "BigCommerce: list inventory",
-    description: "Read stock levels per location: available to sell, total on hand and safety stock, by SKU, product, variant or location. Use this rather than a product's single `inventoryLevel` when the store ships from more than one location.",
+    description: "Read stock levels per location: available to sell, total on hand, quantity backordered, safety stock and in-stock status, filtered by SKU, product, variant or location. One row per SKU and location, so a SKU stocked in three warehouses returns three rows while `pagination` counts SKUs. Use this rather than a product's single `inventoryLevel` when the store ships from more than one location.",
     parametersSchema: object2({
       skus: {
         type: "array",
@@ -43159,11 +43256,16 @@ var plugin = definePlugin({
   /**
    * Shape-only validation, and the "only" is deliberate.
    *
-   * The host calls this on start, on save, and behind the settings page's Test
-   * Connection button — but it passes the config without a company ID, and
-   * resolving the token ref requires one. So this cannot make a live request.
-   * It checks what it can and says plainly what it did not check, rather than
-   * reporting a green "connected" that was never tested.
+   * The host calls this from exactly one place: the settings page's Test
+   * Connection button. Saving the config does not call it — `POST
+   * /api/plugins/:id/config` validates against `instanceConfigSchema` with Ajv
+   * and nothing else — so anything that must block a save has to be expressible
+   * in that schema, and this function is a second opinion rather than a gate.
+   *
+   * It also cannot make a live request: the host passes the config without a
+   * company ID, and resolving the token ref requires one. So it checks what it
+   * can and says plainly what it did not check, rather than reporting a green
+   * "connected" that was never tested.
    */
   async onValidateConfig(config2) {
     const errors = [];

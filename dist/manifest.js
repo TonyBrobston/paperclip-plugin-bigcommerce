@@ -61,7 +61,7 @@ var TOOL_DECLARATIONS = [
   {
     name: TOOL_NAMES.getStoreInfo,
     displayName: "BigCommerce: get store info",
-    description: "Get the store's identity and settings: name, domain, status, currency, weight and dimension units, time zone and plan. Start here to confirm which store this plugin is pointed at and what currency and units the other tools' numbers are in.",
+    description: "Get the store's identity and settings: store hash and numeric ID, name, domain, status, currency, weight and dimension units, time zone and plan. Start here to confirm which store this plugin is pointed at and what currency and units the other tools' numbers are in.",
     parametersSchema: object({})
   },
   {
@@ -102,6 +102,11 @@ var TOOL_DECLARATIONS = [
         type: "string",
         enum: ["id", "name", "sku", "price", "date_modified", "inventory_level", "total_sold"],
         description: "Field to sort by."
+      },
+      direction: {
+        type: "string",
+        enum: ["asc", "desc"],
+        description: "Sort direction (default asc). Use sort=date_modified with direction=desc for the most recently changed products."
       },
       ...paging
     })
@@ -149,7 +154,7 @@ var TOOL_DECLARATIONS = [
   {
     name: TOOL_NAMES.listCategories,
     displayName: "BigCommerce: list categories",
-    description: "List storefront categories with their parent IDs, so the category hierarchy can be reconstructed. With no tree ID it lists categories for every category tree in the store and tags each with the tree it came from.",
+    description: "List storefront categories \u2014 every level, not just the top \u2014 with their parent IDs, so the hierarchy can be reconstructed. Each row says which category tree it came from, because a multi-storefront store has one tree per storefront and the same category name can exist in several.",
     parametersSchema: object({
       treeId: {
         type: "integer",
@@ -163,8 +168,8 @@ var TOOL_DECLARATIONS = [
       },
       parentId: {
         type: "integer",
-        minimum: 1,
-        description: "Only direct children of this category."
+        minimum: 0,
+        description: "Only direct children of this category. Use 0 for the top-level categories of a tree."
       },
       ...paging
     })
@@ -226,7 +231,7 @@ var TOOL_DECLARATIONS = [
   {
     name: TOOL_NAMES.getOrder,
     displayName: "BigCommerce: get order",
-    description: "Get one order's full record: status and status history fields, every money field, payment and shipping details, and the billing address. Contains customer personal data \u2014 see the plugin README.",
+    description: "Get one order's detail: status, dates, every money field, payment method and status, the shopper's order message, and the billing address. The shopper's IP address and the merchant's internal staff notes are deliberately not returned. Contains customer personal data \u2014 see the plugin README.",
     parametersSchema: object(
       { orderId: { type: "integer", minimum: 1, description: "The order's ID." } },
       ["orderId"]
@@ -247,7 +252,7 @@ var TOOL_DECLARATIONS = [
   {
     name: TOOL_NAMES.listCustomers,
     displayName: "BigCommerce: list customers",
-    description: "Search and list customer accounts, returning a compact row per customer (ID, email, name, company, group). Use this to resolve an email into the `customerId` that list_orders filters on. Contains customer personal data \u2014 see the plugin README.",
+    description: "Search and list customer accounts, returning a compact row per customer (ID, email, name, company, group, signup date). Use this to resolve an email into the `customerId` that list_orders filters on. Contains customer personal data \u2014 see the plugin README.",
     parametersSchema: object({
       email: {
         type: "string",
@@ -276,7 +281,7 @@ var TOOL_DECLARATIONS = [
   {
     name: TOOL_NAMES.listInventory,
     displayName: "BigCommerce: list inventory",
-    description: "Read stock levels per location: available to sell, total on hand and safety stock, by SKU, product, variant or location. Use this rather than a product's single `inventoryLevel` when the store ships from more than one location.",
+    description: "Read stock levels per location: available to sell, total on hand, quantity backordered, safety stock and in-stock status, filtered by SKU, product, variant or location. One row per SKU and location, so a SKU stocked in three warehouses returns three rows while `pagination` counts SKUs. Use this rather than a product's single `inventoryLevel` when the store ships from more than one location.",
     parametersSchema: object({
       skus: {
         type: "array",
@@ -356,7 +361,14 @@ var manifest = {
         type: "string",
         title: "API origin (optional)",
         description: `Leave blank for the BigCommerce API at ${DEFAULT_API_ORIGIN}. Set it only to send requests through a proxy or a mock. Must be https, with no path; plain http is accepted only for a loopback address, because the access token travels in a header on every request.`,
-        pattern: "^$|^https?://[^\\s/?#@]+/*$"
+        // This pattern has to carry the https restriction itself, because it is
+        // the only check a save runs. The host's `onValidateConfig` RPC is
+        // called from exactly one place — the settings page's Test Connection
+        // button — while `POST /api/plugins/:id/config` validates with Ajv
+        // against this schema and nothing else. Without the restriction here,
+        // `http://api.bigcommerce.com` saved green and then failed every tool
+        // call at request time: a dead config rather than a refused one.
+        pattern: "^$|^https://[^\\s/?#@]+/*$|^http://(localhost|127(\\.\\d{1,3}){3}|\\[::1\\])(:\\d{1,5})?/*$"
       }
     },
     required: [CONFIG_KEYS.storeHash, CONFIG_KEYS.accessToken]

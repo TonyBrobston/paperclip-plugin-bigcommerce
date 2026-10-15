@@ -67,7 +67,15 @@ const manifest: PaperclipPluginManifestV1 = {
         type: "string",
         title: "API origin (optional)",
         description: `Leave blank for the BigCommerce API at ${DEFAULT_API_ORIGIN}. Set it only to send requests through a proxy or a mock. Must be https, with no path; plain http is accepted only for a loopback address, because the access token travels in a header on every request.`,
-        pattern: "^$|^https?://[^\\s/?#@]+/*$",
+        // This pattern has to carry the https restriction itself, because it is
+        // the only check a save runs. The host's `onValidateConfig` RPC is
+        // called from exactly one place — the settings page's Test Connection
+        // button — while `POST /api/plugins/:id/config` validates with Ajv
+        // against this schema and nothing else. Without the restriction here,
+        // `http://api.bigcommerce.com` saved green and then failed every tool
+        // call at request time: a dead config rather than a refused one.
+        pattern:
+          "^$|^https://[^\\s/?#@]+/*$|^http://(localhost|127(\\.\\d{1,3}){3}|\\[::1\\])(:\\d{1,5})?/*$",
       },
     },
     required: [CONFIG_KEYS.storeHash, CONFIG_KEYS.accessToken],

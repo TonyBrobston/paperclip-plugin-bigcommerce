@@ -52,12 +52,6 @@ export const PAGE_LIMIT_DEFAULT = 50;
 /** Highest `page` this plugin will request. Deep paging means a filter is missing. */
 export const PAGE_MAX = 1000;
 
-/**
- * Trees fetched when `list_categories` is called without a tree ID. A store
- * has one tree per storefront channel, so this is generous.
- */
-export const CATEGORY_TREE_FAN_OUT_MAX = 5;
-
 /** Largest response body read from BigCommerce, before parsing. */
 export const RESPONSE_LIMIT_BYTES = 8 * 1024 * 1024;
 

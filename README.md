@@ -9,18 +9,18 @@ Thirteen tools, all reads:
 
 | Tool | What it answers |
 | --- | --- |
-| `get_store_info` | Which store this is: name, domain, currency, units, time zone, plan. |
+| `get_store_info` | Which store this is: store hash and numeric ID, name, domain, currency, units, time zone, plan. |
 | `get_catalog_summary` | How big the catalog is, and its inventory value and price range. |
 | `list_products` | What products exist, with price and stock. Filter by keyword, SKU, category, brand, visibility, inventory or modified date. |
 | `get_product` | One product's full record, optionally with variants, images, custom fields, modifiers, options or videos. |
 | `list_product_variants` | One product's variants, each with its own SKU, price and stock. |
-| `list_categories` | The category hierarchy, across every category tree or one named tree. |
+| `list_categories` | The category hierarchy — every level, with parent IDs — across every category tree or one named tree. |
 | `list_brands` | What brands exist, and their IDs. |
 | `list_orders` | What orders exist, with status, date, customer and total. Filter by status, customer, email, total or date range. |
-| `get_order` | One order's full record. |
+| `get_order` | One order's detail: status, dates, money, payment, the shopper's message and the billing address. |
 | `list_order_products` | What was actually bought on one order. |
 | `list_customers` | What customer accounts exist. Filter by email, name, company or group. |
-| `list_inventory` | Stock per location: available to sell, on hand, safety stock. |
+| `list_inventory` | Stock per SKU and location: available to sell, on hand, backordered, safety stock, in stock. |
 | `list_locations` | What inventory locations exist, so a location ID becomes a place. |
 
 There is no tool that changes anything — no order edits, no price updates, no
@@ -112,6 +112,13 @@ host calls `validateConfig` without a company ID, and resolving the token
 reference requires one. The plugin says so in its own result rather than
 reporting a green "connected" it never tested.
 
+Worth knowing, because it decides where a rule has to live: that button is the
+*only* place the host calls the plugin's `onValidateConfig`. Saving the form
+(`POST /api/plugins/:id/config`) validates against the manifest's
+`instanceConfigSchema` with Ajv and nothing else. So anything that must block a
+save has to be expressible in that schema — which is why the API origin field
+carries its https restriction as a pattern rather than relying on the worker.
+
 To confirm the store resolves and the token is accepted, ask an agent to run
 `get_store_info`. It reads `/v2/store`, which needs only the store-information
 scope and returns nothing about the catalog, orders or customers — so a
@@ -143,11 +150,22 @@ be invalidated individually — rotating means deleting the API account and
 creating another, so keep its reach small from the start.
 
 **Orders and customers are personal data.** `get_order` returns a billing
-address and `list_customers` returns names, emails and phone numbers, and
-anything an agent reads lands in a run's context and its transcript. The list
-tools return deliberately compact rows for this reason — `list_orders` lifts out
-the billing email and leaves the rest of the address behind `get_order` — but
-that is a smaller exposure, not no exposure. If an agent has no business reading
+address and `list_customers` returns names and emails, and anything an agent
+reads lands in a run's context and its transcript. Every tool returns an
+allowlisted row for this reason, chosen rather than inherited:
+
+- `list_orders` lifts out the billing email and leaves the rest of the address
+  behind `get_order`.
+- `list_customers` returns the identifying fields and not the phone number, the
+  registration IP or the merchant's notes — the job is turning an email into a
+  customer ID, and none of those help with it.
+- `get_order` returns the order's state, its money, its payment and the billing
+  address, and deliberately drops the shopper's IP address, the GeoIP country,
+  the merchant's internal staff notes and the external marketplace IDs. A
+  passthrough would have made the exposure "whatever BigCommerce sends today,
+  plus whatever they add next".
+
+That is a smaller exposure, not no exposure. If an agent has no business reading
 customer records, do not grant the customer scope.
 
 ## Why this plugin is read-only
@@ -228,21 +246,29 @@ address**, because the access token travels in a header on every request and
 BigCommerce cannot revoke it on demand — so plaintext is allowed only where it
 cannot leave the machine.
 
-The settings-form pattern is looser than that rule, deliberately: a regex cannot
-express "loopback", so the form accepts any `http` host and the worker refuses
-the non-loopback ones with a reason. A save that silently shipped a long-lived
-credential in cleartext would be worse than one the plugin explains.
+The settings-form pattern enforces that itself — `https` anywhere, or `http`
+only for `localhost`, `127.0.0.0/8` or `[::1]` — rather than leaving it to the
+worker. It has to: the host runs the plugin's own `onValidateConfig` from the
+Test Connection button alone, so a save that the pattern allows is a save that
+happens. With a looser pattern, `http://api.bigcommerce.com` saved green and
+then failed every tool call at request time, which is a dead configuration
+rather than a refused one. The worker still re-checks the origin on every call,
+because stored config can predate the field.
 
 ## Reading the results
 
 A few shapes are worth knowing before an agent's first call.
 
-**Lists are compact; `get_*` is full.** A BigCommerce product carries its whole
-HTML description and every SEO field; an order carries three addresses and a
-dozen money fields. A page of those is mostly payload a run will not read, and
+**Lists are compact; `get_*` is fuller.** A BigCommerce product carries its
+whole HTML description and every SEO field; an order carries three addresses and
+a dozen money fields. A page of those is mostly payload a run will not read, and
 it crowds out the context the run needs. So `list_products` returns the
 identifying and decision-making fields — and asks BigCommerce for only those,
 via `include_fields` — while `get_product` returns the record untouched.
+`get_order` is the one exception to "the `get_*` tool returns everything": it
+returns an allowlist, because the fields it would otherwise add are the
+shopper's IP address and the merchant's internal notes. See [Scope is the access
+control](#scope-is-the-access-control).
 
 **Pagination is normalized across two API versions.** The catalog, customers and
 inventory live on BigCommerce's v3 API, which returns `{ data, meta }` with a
@@ -255,10 +281,35 @@ full page, because guessing a total would be worse than reporting none.
 empty page rather than as a parse failure, which is why `list_orders` on a store
 with no matching orders answers with zero rows instead of an error.
 
-**`list_categories` discovers the trees.** A store has one category tree per
-storefront channel. Called without a `treeId` it lists the trees, then lists
-each one's categories and tags every row with the tree it came from — because
-the same category name can exist in several. Pass `treeId` to skip that.
+**`list_categories` returns a flat list of every level.** Each row carries
+`parentId`, so the hierarchy is reconstructable, and `treeId`/`treeName`,
+because a store has one category tree per storefront channel and the same
+category name can exist in several. Use `parentId: 0` for a tree's top level,
+and `treeId` to stay inside one tree.
+
+**`list_inventory` returns one row per SKU *and location*.** A SKU stocked in
+three warehouses is three rows, each with that location's numbers; `pagination`
+counts the SKUs BigCommerce paged over, so `items.length` can exceed
+`pagination.returned`. A SKU with no location record at all comes back as one
+row of nulls rather than being dropped, so "which of these has no stock record"
+stays answerable.
+
+### Which categories endpoint
+
+Worth recording, because the two are easy to confuse and only one of them works
+for this job. BigCommerce has two category endpoints:
+
+| Endpoint | Shape | Parameters |
+| --- | --- | --- |
+| `/v3/catalog/trees/{tree_id}/categories` | A nested `CategoryNode` tree: subcategories hang off `children[]`, rows carry `id`/`depth`/`path`, and `meta` has no pagination. | `depth` only |
+| `/v3/catalog/trees/categories` ← **used** | A flat `CategoryList`: rows carry `category_id`, `tree_id`, `parent_id`, `sort_order`, and `meta.pagination`. | `tree_id:in`, `parent_id:in`, `category_id:in`, `keyword`, `name`, `is_visible`, `page`, `limit` |
+
+This plugin reads the flat one. The first version read the nested one and mapped
+its rows as if they were flat, which dropped every subcategory, sent `keyword`
+and `parentId` to an endpoint that documents neither, and reported `hasMore`
+from a page count that endpoint never returns. One call now answers across every
+tree, plus one small call to `/v3/catalog/trees` to turn each `tree_id` into a
+name.
 
 **Unknown arguments are refused, not ignored.** Every tool's schema sets
 `additionalProperties: false` and the client re-checks it, so a misspelled
@@ -270,19 +321,59 @@ applied — a wrong answer that looks like a right one.
 ```bash
 npm install
 npm run typecheck
-npm test          # 111 unit tests
-npm run build     # writes dist/worker.js and dist/manifest.js
+npm test              # unit, contract and config tests
+npm run build         # writes dist/worker.js and dist/manifest.js
 npm run smoke
+npm run sync-contract # refresh tests/openapi-contract.json (needs network)
 ```
 
-`scripts/smoke.mjs` is an end-to-end check: it forks the built worker the way
+### Fixtures come from BigCommerce's specs, not from this code
+
+The first version of this plugin shipped three broken tools behind a green test
+suite. Every fixture had been written in the shape the implementation expected —
+the inventory stub put eight fields at the top level because that is where the
+mapper looked for them — so the tests asserted the code against itself and could
+only pass. A fixture that agrees with the code proves nothing.
+
+So the suite has one source of truth the implementation cannot influence:
+
+- `tests/openapi-contract.json` is generated by
+  `scripts/sync-openapi-contract.mjs` from BigCommerce's published OpenAPI
+  specs, and records each endpoint's documented query parameters and response
+  property names along with the URL and SHA-256 of the spec it came from. It is
+  committed so the suite runs offline.
+- `tests/openapi-fixtures.json` holds one spec-shaped response body per
+  endpoint, each naming the schema it was written from. The unit tests and the
+  smoke test both answer from it.
+- `tests/openapi-contract.spec.ts` checks three things against the contract:
+  every query parameter the plugin sends is documented for the path it is sent
+  to, every path it requests is an endpoint that exists, and every property name
+  in the fixtures appears in the response schema it claims to come from. It also
+  checks the plugin's own paging ceiling against the documented one.
+
+All three checks fail on the original `list_categories`, `list_inventory` and
+`list_locations`, which is the point. Re-run `npm run sync-contract` after
+changing an endpoint or a filter and commit the diff: a changed `sha256` means
+BigCommerce edited the spec, and a changed parameter or property list is the part
+worth reading.
+
+`tests/boundary.spec.ts` is the other half of that: the edges — limit and page
+bounds, `maxInventory: 0`, injection-shaped filter values, a unicode SKU, origin
+vetting, and the rule that no error message quotes the store hash, the token or
+the upstream body. Those probes began as hand checks in the QA screening of the
+first pull request, and are committed so nothing can quietly undo them.
+
+`scripts/smoke.mjs` is the end-to-end check: it forks the built worker the way
 the host does, plays the host side of the JSON-RPC protocol — answering the
-worker's `config.get` and `secrets.resolve` calls — and drives real tool calls
-against a stub BigCommerce on `127.0.0.1`. The loopback address is the point
-twice over: it is exactly the case the host's gated fetch helper refuses, and it
-is the one case where this plugin accepts plain `http`, so the `apiOrigin`
-escape hatch is exercised rather than assumed. The stub also answers a `403` and
-a `204` so the scope message and the empty-v2-page path run for real.
+worker's `config.get` and `secrets.resolve` calls — and drives **every tool in
+the catalog** against a stub BigCommerce on `127.0.0.1` that answers from those
+same fixtures. Calling every tool is deliberate: the previous version stubbed
+four endpoints, and all three of its defects lived in the nine tools it never
+touched. The stub refuses any path the fixtures do not cover, and also answers a
+`403` and a `204` so the scope message and the empty-v2-page path run for real.
+The loopback address is the point twice over: it is exactly the case the host's
+gated fetch helper refuses, and it is the one case where this plugin accepts
+plain `http`, so the `apiOrigin` escape hatch is exercised rather than assumed.
 
 Commit `dist/*.js` when you change `src/`, since installs read the built
 output. Sourcemaps are generated but not committed — they are mostly inlined
@@ -297,15 +388,20 @@ store. **Nothing here has touched a real BigCommerce store, and the plugin has
 not been installed on a running Paperclip.** The first real exercise is
 configuring it and asking an agent to run `get_store_info`.
 
-Endpoint paths, query-parameter names, the 250 limit cap, the v2/v3 split and
-the rate-limit header were taken from BigCommerce's published REST
-documentation. Two behaviours are handled from the platform's general
-contract rather than from a sentence in the reference for the specific endpoint,
-because the reference does not state them: that v2 collections answer an empty
-result with `204`, and that `limit` on `/v2/orders` caps at 250 as it does
-elsewhere. Both are handled defensively — a `204` is read as an empty page
-either way, and a limit the API dislikes surfaces as a legible request error —
-so neither is load-bearing.
+Endpoint paths, query-parameter names and response shapes are checked against
+BigCommerce's machine-readable OpenAPI specs by `tests/openapi-contract.spec.ts`
+rather than taken from prose, and the specs they came from are recorded with
+their SHA-256 in `tests/openapi-contract.json`. That is a stronger source than
+the documentation pages, but it is still not a live call: a spec can disagree
+with the API it describes.
+
+Two behaviours are handled from the platform's general contract rather than from
+the reference for the specific endpoint, because the reference does not state
+them: that v2 collections answer an empty result with `204`, and that `limit` on
+`/v2/orders` caps at 250 as it does elsewhere (`/v2/orders` documents no maximum
+at all, so the cap here is this plugin's own). Both are handled defensively — a
+`204` is read as an empty page either way, and a limit the API dislikes surfaces
+as a legible request error — so neither is load-bearing.
 
 The instance-config tests reproduce the host's save-time validator — Ajv with
 formats plus the host's permissive `secret-ref` format, assembled the same way
