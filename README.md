@@ -17,7 +17,7 @@ Fourteen tools, all reads:
 | `list_category_trees` | What category trees exist, with the storefront channels each serves — so a storefront name becomes the tree ID `list_categories` filters on. |
 | `list_categories` | The category hierarchy — every level, with parent IDs — across every category tree or one named tree. |
 | `list_brands` | What brands exist, and their IDs. |
-| `list_orders` | What orders exist, with status, date, customer and total. Filter by status, customer, email, total or date range. |
+| `list_orders` | What orders exist, with status, date, customer and total. Filter by status, customer, email, total or date range, and sort by any documented field in either direction. |
 | `get_order` | One order's detail: status, dates, money, payment, the shopper's message and the billing address. |
 | `list_order_products` | What was actually bought on one order. |
 | `list_customers` | What customer accounts exist. Filter by email, name, company or group. |
@@ -316,7 +316,10 @@ rows — and concluding the page was past the end. A SKU with no location record
 at all comes back as one row of nulls rather than being dropped, so "which of
 these has no stock record" stays answerable.
 
-**With `locationIds` set, every row returned is for one of those locations.**
+**With `locationIds` set, every row with a non-null `locationId` is for one of
+those locations.** The no-location row above is the exception, and the
+distinction matters: a null `locationId` means that SKU has no inventory record
+anywhere, so its `availableToSell: null` is "unknown", not "none in Dallas".
 The filter goes to BigCommerce as `location_id:in`, but the spec only calls it
 "comma separated list of location_id" and never says whether it selects *items*
 or prunes each item's `locations[]` — and the endpoint's own summary ("all items
@@ -353,6 +356,16 @@ knows. And because the trees call is skipped when a category page is empty,
 identically — with this tool, a tree that exists is a row and a tree that does
 not is not.
 
+That only holds if the row list is the whole list, and `/v3/catalog/trees`
+documents no paging parameters, so there is no page 2 to ask for if it ever
+answers short. The tool therefore reports the `total` the response carries and a
+`complete` derived from it; `complete: false` means filter by `treeIds` or
+`channelIds` rather than read the rows as the full set, and `null` means
+BigCommerce sent no count — not that it sent reassurance. For the same reason
+`list_categories` asks for tree names in batches and reports any tree ID it
+could not name in `unresolvedTreeIds`, so a `treeName: null` from a short lookup
+cannot be mistaken for a tree that has no name.
+
 **Unknown arguments are refused, not ignored.** Every tool's schema sets
 `additionalProperties: false` and the client re-checks it, so a misspelled
 filter is an error the agent can fix rather than a filter that silently never
@@ -379,12 +392,18 @@ runs it on demand.
 There are no runtime dependencies — the built worker bundles what it needs, and
 everything in `devDependencies` is a build or test tool. Two notes on them:
 
-- `allowScripts` lists `esbuild` **unpinned**. The pinned form (`esbuild@0.28.2`)
-  is tidier but npm cannot apply it unless the lockfile entry carries a
-  `resolved` URL, and this lockfile's does not; the pinned key silently did
-  nothing, so `npm install` warned and skipped esbuild's postinstall on every
-  clone. On a platform where that postinstall fetches the native binary,
-  `npm run build` then fails with nothing pointing at the skipped script.
+- `allowScripts` pins `esbuild@0.28.2` — the only install script this tree
+  runs. npm can only apply a *pinned* approval if the package's lockfile entry
+  carries a `resolved` URL, and an earlier lockfile here had 16 entries without
+  one, so the approval silently covered nothing and every clone skipped
+  esbuild's postinstall with a warning. On a platform where that postinstall
+  fetches the native binary, `npm run build` then fails with nothing pointing at
+  the skipped script. Backfilling those URLs takes a from-scratch resolve —
+  `rm -rf node_modules package-lock.json && npm install` — because an in-place
+  install reads the versions it already has off disk and never asks the registry
+  for them. Then `npm install-scripts approve esbuild` writes the pinned key.
+  Worth knowing if this comes up again: `allowScripts` is advisory in npm 11.19,
+  so none of this is what makes the build work — it is supply-chain intent.
 - `vitest` is on 5.x. 3.x pulled in a `tinypool` with two critical RCE
   advisories and a path-traversal one in `@vitest/mocker`; the only fix was the
   major bump, which the suite passes unchanged. `npm audit` is clean.
@@ -438,6 +457,18 @@ rule is applied per parameter from `AUTHORITATIVE_ENUMS`, not across the board:
 `/v2/orders` lists bare field names in its `sort` enum while the same
 parameter's description requires the `:asc`/`:desc` suffix the plugin sends, so
 checking that one against its own enum would fail a request that is correct.
+Being the exception is not the same as being unchecked, though — that is how
+`list_orders` kept a hand-picked three of its seven documented sort fields for
+two review rounds, the same defect the rule exists to catch. What gets asserted
+there is the *product*: the documented fields crossed with both directions
+equals `ORDER_SORT_VALUES`, which is what the tool accepts.
+
+**Nothing in the generated file is clock-derived.** It used to carry a
+`generatedAt` date, which made the weekly drift job fail on every run after the
+day it was committed — reporting "BigCommerce changed a spec" about the
+calendar, and burying the one thing it exists to say under a diff that was
+always there. A weekly job that is always red gets muted, and then real drift is
+invisible. Each spec's `sha256` identifies the contract better than a date does.
 
 And what the guard still cannot see, so nobody reads more into a green run than
 it earned: whether a filter is *applied* (it checks that `location_id:in` is

@@ -251,7 +251,14 @@ try {
   if (trees?.trees?.length !== 2) fail("the category trees were not listed");
   if (trees.trees[0]?.name !== "Storefront") fail("tree names were not read");
   if (!Array.isArray(trees.trees[0]?.channelIds)) fail("storefront channels were dropped");
-  console.log(`list_category_trees: ${JSON.stringify(trees.trees)}`);
+  // The endpoint has no paging, so a short answer is only detectable from the
+  // count it carries. Reported rather than dropped, or a truncated list reads
+  // as the whole list and a real tree looks nonexistent.
+  if (trees.complete !== true) fail("the trees list did not report itself complete");
+  if (trees.total !== trees.trees.length) fail("the trees total was not reported");
+  console.log(
+    `list_category_trees: ${JSON.stringify(trees.trees)} total=${trees.total} complete=${trees.complete}`,
+  );
 
   // The flat categories endpoint: every level of the hierarchy, each row
   // naming its tree. The nested endpoint returned the root level only.
@@ -261,6 +268,7 @@ try {
   if (!names.includes("Pipe Wrenches")) fail("subcategories were dropped");
   if (categories.categories.at(-1)?.treeName !== "Wholesale") fail("tree names were not resolved");
   if (categories.categories[1]?.sortOrder !== 2) fail("sortOrder came back null");
+  if (categories.unresolvedTreeIds?.length !== 0) fail("a tree name went unresolved");
 
   const rootsOnly = await ok("list_categories", { treeId: 1, parentId: 0 });
   if (rootsOnly?.categories === undefined) fail("parentId 0 was refused");

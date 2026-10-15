@@ -42082,6 +42082,18 @@ var PRODUCT_SORT_FIELDS = [
   "total_sold"
 ];
 var SORT_DIRECTIONS = ["asc", "desc"];
+var ORDER_SORT_FIELDS = [
+  "channel_id",
+  "customer_id",
+  "date_created",
+  "date_modified",
+  "external_id",
+  "id",
+  "status_id"
+];
+var ORDER_SORT_VALUES = ORDER_SORT_FIELDS.flatMap(
+  (field2) => SORT_DIRECTIONS.map((direction) => `${field2}:${direction}`)
+);
 var PAGE_MAX = 1e3;
 var RESPONSE_LIMIT_BYTES = 8 * 1024 * 1024;
 var REQUEST_TIMEOUT_MS = 3e4;
@@ -42649,7 +42661,7 @@ async function executeTool(options, toolName, parameters) {
     }
     case TOOL_NAMES.listCategoryTrees: {
       rejectUnknownKeys(params, ["treeIds", "channelIds"]);
-      const { rows } = await v3List(
+      const { rows, pagination } = await v3List(
         options,
         "/v3/catalog/trees",
         withFilters(
@@ -42663,6 +42675,13 @@ async function executeTool(options, toolName, parameters) {
         PAGE_LIMIT_DEFAULT
       );
       return {
+        // The response says how many trees matched, and there is no page 2 to
+        // ask for. So if BigCommerce ever answers short, `complete: false` says
+        // so — without it a truncated page reads as the whole list, and a tree
+        // that exists looks nonexistent, which is the one thing this tool was
+        // added to prevent. `null` is "BigCommerce did not say", not "yes".
+        total: pagination.total,
+        complete: pagination.total === null ? null : pagination.total === rows.length,
         trees: rows.map((tree) => ({
           id: tree.id ?? null,
           name: tree.name ?? null,
@@ -42689,7 +42708,15 @@ async function executeTool(options, toolName, parameters) {
         ...new Set(rows.map((row) => row.tree_id).filter((id) => typeof id === "number"))
       ];
       const treeNames = treeIds.length === 0 ? /* @__PURE__ */ new Map() : await categoryTreeNames(options, treeIds);
-      return { pagination, categories: rows.map((row) => summarizeCategory(row, treeNames)) };
+      return {
+        pagination,
+        // Tree IDs on this page that `/v3/catalog/trees` did not return, so
+        // their rows carry `treeName: null`. Normally empty. Without it a null
+        // name reads as "this tree has no name" when it can also mean "the
+        // name lookup came back short", and those call for different reactions.
+        unresolvedTreeIds: treeIds.filter((id) => !treeNames.has(id)),
+        categories: rows.map((row) => summarizeCategory(row, treeNames))
+      };
     }
     case TOOL_NAMES.listBrands: {
       rejectUnknownKeys(params, ["name", "page", "limit"]);
@@ -42728,12 +42755,8 @@ async function executeTool(options, toolName, parameters) {
       ]);
       const { page: page2, limit } = paging(params);
       const sort = optionalString(params, "sort", 32);
-      if (sort !== void 0 && !["id:asc", "id:desc", "date_created:asc", "date_created:desc", "date_modified:asc", "date_modified:desc"].includes(
-        sort
-      )) {
-        throw new InvalidParameterError(
-          '"sort" must be one of id:asc, id:desc, date_created:asc, date_created:desc, date_modified:asc, date_modified:desc.'
-        );
+      if (sort !== void 0 && !ORDER_SORT_VALUES.includes(sort)) {
+        throw new InvalidParameterError(`"sort" must be one of ${ORDER_SORT_VALUES.join(", ")}.`);
       }
       const { rows, pagination } = await v2List(
         options,
@@ -42917,17 +42940,21 @@ async function executeTool(options, toolName, parameters) {
       throw new BigCommerceError(`Unknown BigCommerce tool: ${toolName}`);
   }
 }
+var TREE_LOOKUP_BATCH = 50;
 async function categoryTreeNames(options, treeIds) {
-  const { rows } = await v3List(
-    options,
-    "/v3/catalog/trees",
-    { "id:in": treeIds.join(",") },
-    1,
-    PAGE_LIMIT_DEFAULT
-  );
   const names = /* @__PURE__ */ new Map();
-  for (const tree of rows) {
-    if (typeof tree.id === "number") names.set(tree.id, tree.name ?? null);
+  for (let index = 0; index < treeIds.length; index += TREE_LOOKUP_BATCH) {
+    const batch = treeIds.slice(index, index + TREE_LOOKUP_BATCH);
+    const { rows } = await v3List(
+      options,
+      "/v3/catalog/trees",
+      { "id:in": batch.join(",") },
+      1,
+      PAGE_LIMIT_DEFAULT
+    );
+    for (const tree of rows) {
+      if (typeof tree.id === "number") names.set(tree.id, tree.name ?? null);
+    }
   }
   return names;
 }
@@ -43103,7 +43130,7 @@ var TOOL_DECLARATIONS = [
   {
     name: TOOL_NAMES.listCategoryTrees,
     displayName: "BigCommerce: list category trees",
-    description: "List the store's category trees with their IDs, names and the storefront channels each serves. A store has one tree per storefront, so this is how a storefront name becomes the `treeId` that list_categories filters on \u2014 and how an empty category list can be told apart from a tree ID that does not exist.",
+    description: "List the store's category trees with their IDs, names and the storefront channels each serves. A store has one tree per storefront, so this is how a storefront name becomes the `treeId` that list_categories filters on \u2014 and how an empty category list can be told apart from a tree ID that does not exist. `total` is how many trees matched and `complete` says whether every one of them is in `trees`; this endpoint has no paging, so treat `complete: false` as a reason to filter rather than as a full list.",
     parametersSchema: object2({
       treeIds: idArray("Return only these tree IDs.", 50),
       channelIds: idArray("Return only the trees serving these storefront channel IDs.", 50)
@@ -43112,7 +43139,7 @@ var TOOL_DECLARATIONS = [
   {
     name: TOOL_NAMES.listCategories,
     displayName: "BigCommerce: list categories",
-    description: "List storefront categories \u2014 every level, not just the top \u2014 with their parent IDs, so the hierarchy can be reconstructed. Each row says which category tree it came from, because a multi-storefront store has one tree per storefront and the same category name can exist in several.",
+    description: "List storefront categories \u2014 every level, not just the top \u2014 with their parent IDs, so the hierarchy can be reconstructed. Each row says which category tree it came from, because a multi-storefront store has one tree per storefront and the same category name can exist in several. A tree ID listed in `unresolvedTreeIds` is one whose name could not be looked up, so rows pointing at it have `treeName: null` for that reason and not because the tree is unnamed.",
     parametersSchema: object2({
       treeId: {
         type: "integer",
@@ -43173,15 +43200,8 @@ var TOOL_DECLARATIONS = [
       },
       sort: {
         type: "string",
-        enum: [
-          "id:asc",
-          "id:desc",
-          "date_created:asc",
-          "date_created:desc",
-          "date_modified:asc",
-          "date_modified:desc"
-        ],
-        description: "Sort field and direction. Use date_created:desc for the newest orders."
+        enum: [...ORDER_SORT_VALUES],
+        description: "Sort field and direction \u2014 this endpoint wants them as one `field:direction` value rather than as two parameters. Use date_created:desc for the newest orders."
       },
       ...paging2
     })
@@ -43239,7 +43259,7 @@ var TOOL_DECLARATIONS = [
   {
     name: TOOL_NAMES.listInventory,
     displayName: "BigCommerce: list inventory",
-    description: "Read stock levels per location: available to sell, total on hand, quantity backordered, safety stock and in-stock status, filtered by SKU, product, variant or location. One row per SKU and location, so a SKU stocked in three warehouses returns three rows: `pagination.skusReturned` counts SKUs, which is what `limit`, `total` and `hasMore` are in, and `pagination.rowsReturned` counts rows. With `locationIds` set, every row returned is for one of those locations. Use this rather than a product's single `inventoryLevel` when the store ships from more than one location.",
+    description: "Read stock levels per location: available to sell, total on hand, quantity backordered, safety stock and in-stock status, filtered by SKU, product, variant or location. One row per SKU and location, so a SKU stocked in three warehouses returns three rows: `pagination.skusReturned` counts SKUs, which is what `limit`, `total` and `hasMore` are in, and `pagination.rowsReturned` counts rows. With `locationIds` set, every row whose `locationId` is non-null is for one of those locations; a row with a null `locationId` means that SKU has no inventory record in any location, so its quantities are unknown rather than zero at the locations you asked for. Use this rather than a product's single `inventoryLevel` when the store ships from more than one location.",
     parametersSchema: object2({
       skus: {
         type: "array",

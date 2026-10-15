@@ -13,6 +13,7 @@ import {
   API_ORIGIN_PATTERN,
   DEFAULT_API_ORIGIN,
   LOOPBACK_SPELLINGS,
+  ORDER_SORT_VALUES,
   PAGE_LIMIT_DEFAULT,
   PAGE_LIMIT_MAX,
   PAGE_MAX,
@@ -709,7 +710,7 @@ export async function executeTool(
       // endpoint that never promised them is how the old `list_categories`
       // reported a `hasMore` it had invented. A store has one tree per
       // storefront, so the whole list is one response.
-      const { rows } = await v3List(
+      const { rows, pagination } = await v3List(
         options,
         "/v3/catalog/trees",
         withFilters(
@@ -723,6 +724,13 @@ export async function executeTool(
         PAGE_LIMIT_DEFAULT,
       );
       return {
+        // The response says how many trees matched, and there is no page 2 to
+        // ask for. So if BigCommerce ever answers short, `complete: false` says
+        // so — without it a truncated page reads as the whole list, and a tree
+        // that exists looks nonexistent, which is the one thing this tool was
+        // added to prevent. `null` is "BigCommerce did not say", not "yes".
+        total: pagination.total,
+        complete: pagination.total === null ? null : pagination.total === rows.length,
         trees: rows.map((tree) => ({
           id: tree.id ?? null,
           name: tree.name ?? null,
@@ -771,7 +779,15 @@ export async function executeTool(
         ...new Set(rows.map((row) => row.tree_id).filter((id): id is number => typeof id === "number")),
       ];
       const treeNames = treeIds.length === 0 ? new Map() : await categoryTreeNames(options, treeIds);
-      return { pagination, categories: rows.map((row) => summarizeCategory(row, treeNames)) };
+      return {
+        pagination,
+        // Tree IDs on this page that `/v3/catalog/trees` did not return, so
+        // their rows carry `treeName: null`. Normally empty. Without it a null
+        // name reads as "this tree has no name" when it can also mean "the
+        // name lookup came back short", and those call for different reactions.
+        unresolvedTreeIds: treeIds.filter((id) => !treeNames.has(id)),
+        categories: rows.map((row) => summarizeCategory(row, treeNames)),
+      };
     }
 
     case TOOL_NAMES.listBrands: {
@@ -812,15 +828,10 @@ export async function executeTool(
       ]);
       const { page, limit } = paging(params);
       const sort = optionalString(params, "sort", 32);
-      if (
-        sort !== undefined &&
-        !["id:asc", "id:desc", "date_created:asc", "date_created:desc", "date_modified:asc", "date_modified:desc"].includes(
-          sort,
-        )
-      ) {
-        throw new InvalidParameterError(
-          '"sort" must be one of id:asc, id:desc, date_created:asc, date_created:desc, date_modified:asc, date_modified:desc.',
-        );
+      // Every documented field in both directions, derived rather than
+      // hand-picked. See `ORDER_SORT_VALUES`.
+      if (sort !== undefined && !ORDER_SORT_VALUES.includes(sort)) {
+        throw new InvalidParameterError(`"sort" must be one of ${ORDER_SORT_VALUES.join(", ")}.`);
       }
       const { rows, pagination } = await v2List(
         options,
@@ -1051,21 +1062,33 @@ export async function executeTool(
  * `/v3/catalog/trees` documents only `id:in` and `channel_id:in` — no paging —
  * so it is asked for the specific trees wanted rather than for all of them and
  * a hope that they fit in one response.
+ *
+ * It is asked in batches because "the specific trees wanted" can be up to one
+ * full page of categories' worth of distinct trees, and an undocumented
+ * default page size is the one thing that could still truncate the answer. A
+ * batch is well inside any plausible page size, and the keys of the returned
+ * map say which IDs actually came back — a tree absent from it is reported as
+ * unresolved rather than as a tree without a name.
  */
+const TREE_LOOKUP_BATCH = 50;
+
 async function categoryTreeNames(
   options: ClientOptions,
   treeIds: readonly number[],
 ): Promise<Map<number, unknown>> {
-  const { rows } = await v3List(
-    options,
-    "/v3/catalog/trees",
-    { "id:in": treeIds.join(",") },
-    1,
-    PAGE_LIMIT_DEFAULT,
-  );
   const names = new Map<number, unknown>();
-  for (const tree of rows) {
-    if (typeof tree.id === "number") names.set(tree.id, tree.name ?? null);
+  for (let index = 0; index < treeIds.length; index += TREE_LOOKUP_BATCH) {
+    const batch = treeIds.slice(index, index + TREE_LOOKUP_BATCH);
+    const { rows } = await v3List(
+      options,
+      "/v3/catalog/trees",
+      { "id:in": batch.join(",") },
+      1,
+      PAGE_LIMIT_DEFAULT,
+    );
+    for (const tree of rows) {
+      if (typeof tree.id === "number") names.set(tree.id, tree.name ?? null);
+    }
   }
   return names;
 }

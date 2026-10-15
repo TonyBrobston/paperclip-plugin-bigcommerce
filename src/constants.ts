@@ -121,6 +121,46 @@ export const PRODUCT_SORT_FIELDS = [
 
 export const SORT_DIRECTIONS = ["asc", "desc"] as const;
 
+/**
+ * The sort fields `/v2/orders` documents.
+ *
+ * Kept separate from `PRODUCT_SORT_FIELDS` because the two endpoints disagree
+ * about how a direction is expressed: v3 products takes `direction` as its own
+ * parameter, while v2 orders wants the `field:asc` / `field:desc` form that
+ * `ORDER_SORT_VALUES` builds below.
+ *
+ * This is the spec's full enum. An earlier inline list accepted three of these
+ * seven fields, so `customer_id`, `status_id`, `channel_id` and `external_id`
+ * were refused in both directions — 8 of 14 documented combinations rejected,
+ * and an agent asked for "this customer's orders by status" got a parameter
+ * error that read like a broken tool. `openapi-contract.spec.ts` asserts this
+ * list against the spec's enum.
+ */
+export const ORDER_SORT_FIELDS = [
+  "channel_id",
+  "customer_id",
+  "date_created",
+  "date_modified",
+  "external_id",
+  "id",
+  "status_id",
+] as const;
+
+/**
+ * What `list_orders` accepts for `sort`: every documented field × both
+ * directions.
+ *
+ * The suffix is required rather than optional because `/v2/orders` contradicts
+ * itself here — the `sort` enum lists bare field names while the same
+ * parameter's description says "Acceptable values are: `<field>:asc`,
+ * `<field>:desc`". The suffixed form is what the API honours, which is why the
+ * contract test checks this product against the enum instead of checking the
+ * accepted strings against it directly.
+ */
+export const ORDER_SORT_VALUES = ORDER_SORT_FIELDS.flatMap((field) =>
+  SORT_DIRECTIONS.map((direction) => `${field}:${direction}`),
+);
+
 /** Highest `page` this plugin will request. Deep paging means a filter is missing. */
 export const PAGE_MAX = 1000;
 

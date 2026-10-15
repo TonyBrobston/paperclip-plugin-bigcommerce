@@ -40,6 +40,6 @@
     "vitest": "^5.0.4"
   },
   "allowScripts": {
-    "esbuild": true
+    "esbuild@0.28.2": true
   }
 }

@@ -42,6 +42,18 @@ var PRODUCT_SORT_FIELDS = [
   "total_sold"
 ];
 var SORT_DIRECTIONS = ["asc", "desc"];
+var ORDER_SORT_FIELDS = [
+  "channel_id",
+  "customer_id",
+  "date_created",
+  "date_modified",
+  "external_id",
+  "id",
+  "status_id"
+];
+var ORDER_SORT_VALUES = ORDER_SORT_FIELDS.flatMap(
+  (field) => SORT_DIRECTIONS.map((direction) => `${field}:${direction}`)
+);
 var PAGE_MAX = 1e3;
 var RESPONSE_LIMIT_BYTES = 8 * 1024 * 1024;
 var CONFIG_KEYS = {
@@ -177,7 +189,7 @@ var TOOL_DECLARATIONS = [
   {
     name: TOOL_NAMES.listCategoryTrees,
     displayName: "BigCommerce: list category trees",
-    description: "List the store's category trees with their IDs, names and the storefront channels each serves. A store has one tree per storefront, so this is how a storefront name becomes the `treeId` that list_categories filters on \u2014 and how an empty category list can be told apart from a tree ID that does not exist.",
+    description: "List the store's category trees with their IDs, names and the storefront channels each serves. A store has one tree per storefront, so this is how a storefront name becomes the `treeId` that list_categories filters on \u2014 and how an empty category list can be told apart from a tree ID that does not exist. `total` is how many trees matched and `complete` says whether every one of them is in `trees`; this endpoint has no paging, so treat `complete: false` as a reason to filter rather than as a full list.",
     parametersSchema: object({
       treeIds: idArray("Return only these tree IDs.", 50),
       channelIds: idArray("Return only the trees serving these storefront channel IDs.", 50)
@@ -186,7 +198,7 @@ var TOOL_DECLARATIONS = [
   {
     name: TOOL_NAMES.listCategories,
     displayName: "BigCommerce: list categories",
-    description: "List storefront categories \u2014 every level, not just the top \u2014 with their parent IDs, so the hierarchy can be reconstructed. Each row says which category tree it came from, because a multi-storefront store has one tree per storefront and the same category name can exist in several.",
+    description: "List storefront categories \u2014 every level, not just the top \u2014 with their parent IDs, so the hierarchy can be reconstructed. Each row says which category tree it came from, because a multi-storefront store has one tree per storefront and the same category name can exist in several. A tree ID listed in `unresolvedTreeIds` is one whose name could not be looked up, so rows pointing at it have `treeName: null` for that reason and not because the tree is unnamed.",
     parametersSchema: object({
       treeId: {
         type: "integer",
@@ -247,15 +259,8 @@ var TOOL_DECLARATIONS = [
       },
       sort: {
         type: "string",
-        enum: [
-          "id:asc",
-          "id:desc",
-          "date_created:asc",
-          "date_created:desc",
-          "date_modified:asc",
-          "date_modified:desc"
-        ],
-        description: "Sort field and direction. Use date_created:desc for the newest orders."
+        enum: [...ORDER_SORT_VALUES],
+        description: "Sort field and direction \u2014 this endpoint wants them as one `field:direction` value rather than as two parameters. Use date_created:desc for the newest orders."
       },
       ...paging
     })
@@ -313,7 +318,7 @@ var TOOL_DECLARATIONS = [
   {
     name: TOOL_NAMES.listInventory,
     displayName: "BigCommerce: list inventory",
-    description: "Read stock levels per location: available to sell, total on hand, quantity backordered, safety stock and in-stock status, filtered by SKU, product, variant or location. One row per SKU and location, so a SKU stocked in three warehouses returns three rows: `pagination.skusReturned` counts SKUs, which is what `limit`, `total` and `hasMore` are in, and `pagination.rowsReturned` counts rows. With `locationIds` set, every row returned is for one of those locations. Use this rather than a product's single `inventoryLevel` when the store ships from more than one location.",
+    description: "Read stock levels per location: available to sell, total on hand, quantity backordered, safety stock and in-stock status, filtered by SKU, product, variant or location. One row per SKU and location, so a SKU stocked in three warehouses returns three rows: `pagination.skusReturned` counts SKUs, which is what `limit`, `total` and `hasMore` are in, and `pagination.rowsReturned` counts rows. With `locationIds` set, every row whose `locationId` is non-null is for one of those locations; a row with a null `locationId` means that SKU has no inventory record in any location, so its quantities are unknown rather than zero at the locations you asked for. Use this rather than a product's single `inventoryLevel` when the store ships from more than one location.",
     parametersSchema: object({
       skus: {
         type: "array",

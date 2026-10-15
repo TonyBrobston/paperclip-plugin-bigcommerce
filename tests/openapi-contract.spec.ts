@@ -47,6 +47,8 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { executeTool, type ClientOptions } from "../src/bigcommerce.js";
 import {
+  ORDER_SORT_FIELDS,
+  ORDER_SORT_VALUES,
   PAGE_LIMIT_MAX,
   PRODUCT_SORT_FIELDS,
   SORT_DIRECTIONS,
@@ -251,6 +253,10 @@ describe("requests match the published endpoints", () => {
    * enum would fail a request that is right. So the rule is opt-in, and each
    * entry here is a parameter whose enum was read and found consistent with its
    * own description.
+   *
+   * `/v2/orders` is checked a row down instead of being skipped — being the
+   * exception was how it kept a hand-picked three of seven sort fields for two
+   * review rounds, which is the very thing this rule exists to catch.
    */
   const AUTHORITATIVE_ENUMS: Array<{
     path: string;
@@ -268,6 +274,24 @@ describe("requests match the published endpoints", () => {
       expect([...allowed].sort()).toEqual(documented);
     });
   }
+
+  /**
+   * The spec/description contradiction at `/v2/orders` is a reason to compare
+   * something other than the raw strings — not a reason to compare nothing.
+   * The plugin's accepted values are the documented fields crossed with both
+   * directions, so that product is what gets asserted, and a field BigCommerce
+   * adds or the plugin drops fails here either way.
+   */
+  it("accepts every documented /v2/orders sort field, in both directions", () => {
+    const documented = contract.endpoints["/v2/orders"]?.queryParameters.sort?.enum;
+    expect(documented, "sort has no documented enum for /v2/orders").toBeDefined();
+    expect([...ORDER_SORT_FIELDS].sort()).toEqual(documented);
+    expect([...ORDER_SORT_VALUES].sort()).toEqual(
+      (documented ?? [])
+        .flatMap((field) => SORT_DIRECTIONS.map((direction) => `${field}:${direction}`))
+        .sort(),
+    );
+  });
 
   it("keeps its paging ceiling inside the documented one", () => {
     const documented = Object.entries(contract.endpoints).flatMap(([path, endpoint]) => {

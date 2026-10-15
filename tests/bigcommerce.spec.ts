@@ -23,7 +23,12 @@ import {
   probe,
   type ClientOptions,
 } from "../src/bigcommerce.js";
-import { PAGE_LIMIT_DEFAULT, PAGE_LIMIT_MAX, TOOL_NAMES } from "../src/constants.js";
+import {
+  ORDER_SORT_VALUES,
+  PAGE_LIMIT_DEFAULT,
+  PAGE_LIMIT_MAX,
+  TOOL_NAMES,
+} from "../src/constants.js";
 
 interface Recorded {
   url: URL;
@@ -591,6 +596,33 @@ describe("orders", () => {
     });
   });
 
+  /**
+   * `/v2/orders` documents seven sort fields. An inline allowlist accepted
+   * three of them, so "this customer's orders" and "by status" came back as a
+   * parameter error that read like a broken tool. The accepted set is now the
+   * documented fields crossed with both directions, asserted against the spec
+   * in `openapi-contract.spec.ts`.
+   */
+  it("accepts every documented sort field in both directions", async () => {
+    for (const sort of ORDER_SORT_VALUES) {
+      const options = client([{ status: 204 }]);
+      await executeTool(options, TOOL_NAMES.listOrders, { sort });
+      expect(query(calls.length - 1).sort).toBe(sort);
+    }
+    expect(ORDER_SORT_VALUES).toHaveLength(14);
+  });
+
+  it("rejects a sort it cannot honour rather than letting BigCommerce 422", async () => {
+    const options = client([{ status: 204 }]);
+    // Right field, no direction — the suffix is what this endpoint honours.
+    await expect(
+      executeTool(options, TOOL_NAMES.listOrders, { sort: "customer_id" }),
+    ).rejects.toBeInstanceOf(InvalidParameterError);
+    await expect(
+      executeTool(options, TOOL_NAMES.listOrders, { sort: "total_revenue:asc" }),
+    ).rejects.toBeInstanceOf(InvalidParameterError);
+  });
+
   it("returns one order's detail, including the billing address", async () => {
     const options = client([{ body: fixture("/v2/orders/{order_id}") }]);
     const result = (await executeTool(options, TOOL_NAMES.getOrder, { orderId: 1042 })) as Record<
@@ -741,6 +773,40 @@ describe("category trees", () => {
       executeTool(options, TOOL_NAMES.listCategoryTrees, { page: 1 }),
     ).rejects.toBeInstanceOf(InvalidParameterError);
   });
+
+  /**
+   * The endpoint documents no paging parameters, so there is no page 2 to ask
+   * for — which makes a short response indistinguishable from a complete one
+   * unless the count in it is reported. A truncated list reading as the whole
+   * list would make a real tree look nonexistent, the exact failure this tool
+   * was added to prevent.
+   */
+  it("says when the list it returns is not the whole list", async () => {
+    const truncated = client([
+      {
+        body: v3([{ id: 1, name: "Storefront", channels: [1] }], { total: 120, total_pages: 60 }),
+      },
+    ]);
+    expect(await executeTool(truncated, TOOL_NAMES.listCategoryTrees, {})).toMatchObject({
+      total: 120,
+      complete: false,
+    });
+
+    const whole = client([{ body: fixture("/v3/catalog/trees") }]);
+    expect(await executeTool(whole, TOOL_NAMES.listCategoryTrees, {})).toMatchObject({
+      total: 2,
+      complete: true,
+    });
+  });
+
+  /** No count from BigCommerce is "unknown", not "yes, that was all of them". */
+  it("does not claim completeness BigCommerce did not state", async () => {
+    const options = client([{ body: { data: [{ id: 1, name: "Storefront", channels: [1] }] } }]);
+    expect(await executeTool(options, TOOL_NAMES.listCategoryTrees, {})).toMatchObject({
+      total: null,
+      complete: null,
+    });
+  });
 });
 
 describe("categories", () => {
@@ -860,6 +926,63 @@ describe("categories", () => {
     })) as { categories: unknown[] };
     expect(result.categories).toEqual([]);
     expect(calls).toHaveLength(1);
+  });
+
+  /**
+   * `treeName: null` had two meanings — "this tree has no name" and "the name
+   * lookup came back short" — and an agent cannot tell them apart from the row
+   * alone. The second one is the null `treeName` that was already fixed once;
+   * it can still arrive through a truncated trees response.
+   */
+  it("says which tree IDs it could not name, instead of a bare null", async () => {
+    const options = client([
+      {
+        body: v3([
+          { category_id: 10, tree_id: 1, name: "Tools", parent_id: 0 },
+          { category_id: 11, tree_id: 2, name: "Bulk", parent_id: 0 },
+        ]),
+      },
+      // Asked for trees 1 and 2, answered with tree 1 only.
+      { body: v3([{ id: 1, name: "Storefront", channels: [1] }]) },
+    ]);
+    const result = (await executeTool(options, TOOL_NAMES.listCategories, {})) as {
+      unresolvedTreeIds: number[];
+      categories: Array<Record<string, unknown>>;
+    };
+    expect(result.unresolvedTreeIds).toEqual([2]);
+    expect(result.categories[1]).toMatchObject({ treeId: 2, treeName: null });
+
+    const whole = (await executeTool(categoryClient(), TOOL_NAMES.listCategories, {})) as {
+      unresolvedTreeIds: number[];
+    };
+    expect(whole.unresolvedTreeIds).toEqual([]);
+  });
+
+  /**
+   * One page of categories can mention more distinct trees than an
+   * undocumented default page size on `/v3/catalog/trees` would return, and
+   * there is no paging parameter to recover with — so the IDs are asked for in
+   * batches small enough that a truncated answer cannot arise.
+   */
+  it("asks for tree names in batches rather than in one oversized request", async () => {
+    const categories = Array.from({ length: 60 }, (_, index) => ({
+      category_id: 100 + index,
+      tree_id: index + 1,
+      name: `Category ${index}`,
+      parent_id: 0,
+    }));
+    const options = client([
+      { body: v3(categories, { total: 60, total_pages: 1 }) },
+      { body: v3(categories.slice(0, 50).map((row) => ({ id: row.tree_id, name: "T", channels: [] }))) },
+      { body: v3(categories.slice(50).map((row) => ({ id: row.tree_id, name: "T", channels: [] }))) },
+    ]);
+    const result = (await executeTool(options, TOOL_NAMES.listCategories, { limit: 60 })) as {
+      unresolvedTreeIds: number[];
+    };
+    expect(calls).toHaveLength(3);
+    expect(calls[1]!.url.searchParams.get("id:in")!.split(",")).toHaveLength(50);
+    expect(calls[2]!.url.searchParams.get("id:in")!.split(",")).toHaveLength(10);
+    expect(result.unresolvedTreeIds).toEqual([]);
   });
 });
 
