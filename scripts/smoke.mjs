@@ -179,8 +179,13 @@ const runContext = {
   projectId: "project-smoke",
 };
 
-const callTool = (toolName, parameters) =>
-  send("executeTool", { toolName, parameters, runContext });
+/** Every tool this run drove, so the "every tool" claim below is checked. */
+const toolsCalled = new Set();
+
+const callTool = (toolName, parameters) => {
+  toolsCalled.add(toolName);
+  return send("executeTool", { toolName, parameters, runContext });
+};
 
 /** Call one tool, fail on a tool error, and hand back its structured data. */
 async function ok(toolName, parameters = {}) {
@@ -240,6 +245,14 @@ try {
   if (variants?.variants?.[0]?.sku !== "PW-14-RED") fail("wrong variant returned");
   console.log(`list_product_variants: ${variants.variants.length} variant(s)`);
 
+  // The trees themselves, which is how a storefront name becomes a treeId —
+  // and how an empty category list is told apart from a tree that is not there.
+  const trees = await ok("list_category_trees", {});
+  if (trees?.trees?.length !== 2) fail("the category trees were not listed");
+  if (trees.trees[0]?.name !== "Storefront") fail("tree names were not read");
+  if (!Array.isArray(trees.trees[0]?.channelIds)) fail("storefront channels were dropped");
+  console.log(`list_category_trees: ${JSON.stringify(trees.trees)}`);
+
   // The flat categories endpoint: every level of the hierarchy, each row
   // naming its tree. The nested endpoint returned the root level only.
   const categories = await ok("list_categories", {});
@@ -293,6 +306,26 @@ try {
   if (dallas?.availableToSell !== 4) fail("stock numbers came back null");
   if (dallas?.safetyStock !== 2) fail("safety stock was not read from settings");
   if (dallas?.isInStock !== true) fail("in-stock status was not read from settings");
+  if (inventory?.pagination?.skusReturned !== 2) fail("skusReturned did not count SKUs");
+  if (inventory?.pagination?.rowsReturned !== 3) fail("rowsReturned did not count rows");
+
+  // The stub answers the same two-location body whatever `location_id:in` says,
+  // which is the dangerous reading of that filter: it may select *items* rather
+  // than prune each item's `locations[]`. Asking for Dallas and being handed an
+  // Austin row is a wrong number an agent cannot see, so the rows are narrowed
+  // locally too — and this is what proves it, since no amount of contract
+  // checking can tell whether a filter was applied.
+  const dallasOnly = await ok("list_inventory", { locationIds: [1] });
+  if (dallasOnly.items.some((item) => item.locationId !== 1)) {
+    fail(`locationIds did not narrow the rows: ${JSON.stringify(dallasOnly.items)}`);
+  }
+  // The stub serves the same three-row body, so the Austin row being gone is
+  // this plugin's own narrowing and nothing else.
+  if (dallasOnly.items.length !== 2) fail("the matching location rows were not all returned");
+  if (dallasOnly.pagination?.rowsReturned !== 2) fail("rowsReturned did not follow the filter");
+  console.log(
+    `list_inventory(locationIds=[1]): ${dallasOnly.items.length} row(s), all location 1, Austin dropped`,
+  );
 
   const locations = await ok("list_locations", { locationIds: [1, 2] });
   if (locations?.locations?.[0]?.label !== "Dallas Warehouse") fail("wrong location returned");
@@ -324,6 +357,18 @@ try {
   if (!hostCalls.includes("secrets.resolve")) fail("worker never resolved the secret ref");
   if (seenAuth[0] !== TOKEN) fail("token did not arrive as an X-Auth-Token header");
   if (seenAuth.some((value) => value !== TOKEN)) fail("some request went out unauthenticated");
+
+  // "Drives every tool in the catalog" was a claim in this file's header that
+  // nothing checked, and it had already gone stale once: a tool added to the
+  // manifest was never called here. The three endpoint defects QA found all
+  // lived in tools the old version of this script never touched, so the claim
+  // is the whole point of the script and is now enforced rather than asserted.
+  const declared = manifest.tools.map((tool) => tool.name);
+  const untouched = declared.filter((name) => !toolsCalled.has(name));
+  if (untouched.length > 0) fail(`tools never driven by this smoke test: ${untouched.join(", ")}`);
+  const undeclared = [...toolsCalled].filter((name) => !declared.includes(name));
+  if (undeclared.length > 0) fail(`smoke test called undeclared tools: ${undeclared.join(", ")}`);
+  console.log(`tools driven: ${declared.length}/${declared.length} in the manifest`);
 
   console.log(
     "\nPASS: forked worker spoke the protocol, resolved its secret, and read every tool's endpoint off a loopback BigCommerce stub.",

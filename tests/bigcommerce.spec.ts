@@ -679,6 +679,70 @@ describe("orders", () => {
   });
 });
 
+/**
+ * The tool that exists so "no such tree" and "empty tree" stop looking
+ * identical.
+ *
+ * `list_categories` names a tree it finds categories in, but an empty page
+ * skips the trees call entirely — so a mistyped `treeId` and a real tree with
+ * nothing in it both answer `{ categories: [] }`. Nothing else exposes
+ * `/v3/catalog/trees`, so there was no way to tell them apart or to turn a
+ * storefront name into the `treeId` the filter wants.
+ */
+describe("category trees", () => {
+  it("returns each tree's ID, name and storefront channels", async () => {
+    const options = client([{ body: fixture("/v3/catalog/trees") }]);
+    const result = (await executeTool(options, TOOL_NAMES.listCategoryTrees, {})) as {
+      trees: Array<Record<string, unknown>>;
+    };
+    expect(calls[0]!.url.pathname).toBe("/stores/abc123/v3/catalog/trees");
+    expect(result.trees).toEqual([
+      { id: 1, name: "Storefront", channelIds: [1] },
+      { id: 2, name: "Wholesale", channelIds: [2] },
+    ]);
+  });
+
+  it("translates its filters into the endpoint's query names", async () => {
+    const options = client([{ body: fixture("/v3/catalog/trees") }]);
+    await executeTool(options, TOOL_NAMES.listCategoryTrees, { treeIds: [1, 2], channelIds: [1] });
+    expect(query()).toEqual({ "id:in": "1,2", "channel_id:in": "1" });
+  });
+
+  /**
+   * `/v3/catalog/trees` documents `id:in` and `channel_id:in` and nothing else.
+   * Sending `page`/`limit` to an endpoint that never promised them is how the
+   * old `list_categories` came to report a `hasMore` it had invented.
+   */
+  it("sends no paging parameters, and reports no pagination it did not get", async () => {
+    const options = client([{ body: fixture("/v3/catalog/trees") }]);
+    const result = await executeTool(options, TOOL_NAMES.listCategoryTrees, {});
+    expect([...calls[0]!.url.searchParams.keys()]).toEqual([]);
+    expect(result).not.toHaveProperty("pagination");
+  });
+
+  /** An existing tree with nothing in it is a row here; a missing one is not. */
+  it("tells an empty tree apart from a tree ID that does not exist", async () => {
+    const empty = client([{ body: v3([{ id: 7, name: "Outlet", channels: [] }]) }]);
+    const found = (await executeTool(empty, TOOL_NAMES.listCategoryTrees, { treeIds: [7] })) as {
+      trees: unknown[];
+    };
+    expect(found.trees).toEqual([{ id: 7, name: "Outlet", channelIds: [] }]);
+
+    const missing = client([{ body: v3([]) }]);
+    const none = (await executeTool(missing, TOOL_NAMES.listCategoryTrees, {
+      treeIds: [999],
+    })) as { trees: unknown[] };
+    expect(none.trees).toEqual([]);
+  });
+
+  it("rejects an unknown parameter rather than dropping it", async () => {
+    const options = client([{ body: fixture("/v3/catalog/trees") }]);
+    await expect(
+      executeTool(options, TOOL_NAMES.listCategoryTrees, { page: 1 }),
+    ).rejects.toBeInstanceOf(InvalidParameterError);
+  });
+});
+
 describe("categories", () => {
   /** The flat endpoint, then one call to name the trees. */
   function categoryClient() {
@@ -733,10 +797,17 @@ describe("categories", () => {
     expect(result.categories.at(-1)).toMatchObject({ treeId: 2, treeName: "Wholesale" });
   });
 
-  it("sends no paging parameters to the trees endpoint", async () => {
-    // `/v3/catalog/trees` documents only `id:in` and `channel_id:in`.
+  /**
+   * `/v3/catalog/trees` documents only `id:in` and `channel_id:in` — no paging
+   * at all — so asking for "all the trees" and taking what arrives let
+   * `treeName` come back null on a store with more trees than one response
+   * holds. It asks for exactly the trees this page of categories mentions.
+   */
+  it("asks the trees endpoint for this page's trees by ID, and sends no paging", async () => {
     await executeTool(categoryClient(), TOOL_NAMES.listCategories, {});
-    expect([...calls[1]!.url.searchParams.keys()]).toEqual([]);
+    expect([...calls[1]!.url.searchParams.keys()]).toEqual(["id:in"]);
+    // The fixture's categories sit in trees 1 and 2, each asked for once.
+    expect(calls[1]!.url.searchParams.get("id:in")).toBe("1,2");
   });
 
   it("translates its filters into the flat endpoint's query names", async () => {
@@ -847,7 +918,10 @@ describe("customers and inventory", () => {
     const result = (await executeTool(options, TOOL_NAMES.listInventory, {
       skus: ["PW-14-RED"],
       locationIds: [1, 2],
-    })) as { items: Array<Record<string, unknown>>; pagination: { returned: number } };
+    })) as {
+      items: Array<Record<string, unknown>>;
+      pagination: { skusReturned: number; rowsReturned: number };
+    };
     expect(query()).toMatchObject({ "sku:in": "PW-14-RED", "location_id:in": "1,2" });
     expect(result.items[0]).toEqual({
       sku: "PW-14-RED",
@@ -863,10 +937,14 @@ describe("customers and inventory", () => {
       safetyStock: 2,
       isInStock: true,
     });
-    // Two SKUs, three SKU/location pairs: pagination counts the SKUs the API
-    // paged over, `items` carries one row per place the SKU is stocked.
+    // Two SKUs, three SKU/location pairs. Both counts are reported by name,
+    // because `returned` alone reads as "rows" in every other list tool and
+    // here it was the SKU count — so comparing it to `limit` said "last page"
+    // on a page that had more rows than the limit.
     expect(result.items).toHaveLength(3);
-    expect(result.pagination.returned).toBe(2);
+    expect(result.pagination.skusReturned).toBe(2);
+    expect(result.pagination.rowsReturned).toBe(3);
+    expect(result.pagination).not.toHaveProperty("returned");
     expect(result.items[1]).toMatchObject({
       sku: "PW-14-RED",
       locationId: 2,
@@ -875,6 +953,38 @@ describe("customers and inventory", () => {
       isInStock: false,
     });
     expect(result.items[2]).toMatchObject({ sku: "PW-18", locationId: 1, availableToSell: 11 });
+  });
+
+  /**
+   * `location_id:in` reaches the API, but BigCommerce's spec never says whether
+   * it selects items or prunes each item's `locations[]`, and the endpoint
+   * summary leans toward selecting items. If it selects, the Austin row arrives
+   * attached to a SKU asked for in Dallas, and "how many in Dallas" is answered
+   * with the Austin number — a wrong figure with nothing in the output to
+   * reveal it. So the rows are narrowed here too, which is right either way.
+   */
+  it("returns only rows for the locations asked for", async () => {
+    const options = client([{ body: fixture("/v3/inventory/items") }]);
+    const result = (await executeTool(options, TOOL_NAMES.listInventory, {
+      locationIds: [2],
+    })) as {
+      items: Array<Record<string, unknown>>;
+      pagination: { skusReturned: number; rowsReturned: number };
+    };
+    expect(query()["location_id:in"]).toBe("2");
+    expect(result.items.map((item) => item.locationId)).toEqual([2]);
+    // The SKU stocked only in location 1 is not part of the answer, and the
+    // row count says so while the SKU count still reports what the API paged.
+    expect(result.pagination.rowsReturned).toBe(1);
+    expect(result.pagination.skusReturned).toBe(2);
+  });
+
+  it("keeps every location when none was asked for", async () => {
+    const options = client([{ body: fixture("/v3/inventory/items") }]);
+    const result = (await executeTool(options, TOOL_NAMES.listInventory, {})) as {
+      items: Array<Record<string, unknown>>;
+    };
+    expect(result.items.map((item) => item.locationId)).toEqual([1, 2, 1]);
   });
 
   /** `is_in_stock_alternate` exists nowhere in BigCommerce's schema. */

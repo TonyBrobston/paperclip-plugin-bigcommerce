@@ -6,7 +6,14 @@
  * handler or registered without being declared.
  */
 
-import { PAGE_LIMIT_DEFAULT, PAGE_LIMIT_MAX, PAGE_MAX, TOOL_NAMES } from "./constants.js";
+import {
+  PAGE_LIMIT_DEFAULT,
+  PAGE_LIMIT_MAX,
+  PAGE_MAX,
+  PRODUCT_SORT_FIELDS,
+  SORT_DIRECTIONS,
+  TOOL_NAMES,
+} from "./constants.js";
 
 export interface ToolDeclaration {
   name: string;
@@ -98,12 +105,13 @@ export const TOOL_DECLARATIONS: readonly ToolDeclaration[] = [
       },
       sort: {
         type: "string",
-        enum: ["id", "name", "sku", "price", "date_modified", "inventory_level", "total_sold"],
-        description: "Field to sort by.",
+        enum: [...PRODUCT_SORT_FIELDS],
+        description:
+          "Field to sort by. calculated_price is the price a shopper would pay and available_to_sell is sellable stock, which are usually the two worth sorting on.",
       },
       direction: {
         type: "string",
-        enum: ["asc", "desc"],
+        enum: [...SORT_DIRECTIONS],
         description:
           "Sort direction (default asc). Use sort=date_modified with direction=desc for the most recently changed products.",
       },
@@ -151,6 +159,16 @@ export const TOOL_DECLARATIONS: readonly ToolDeclaration[] = [
       },
       ["productId"],
     ),
+  },
+  {
+    name: TOOL_NAMES.listCategoryTrees,
+    displayName: "BigCommerce: list category trees",
+    description:
+      "List the store's category trees with their IDs, names and the storefront channels each serves. A store has one tree per storefront, so this is how a storefront name becomes the `treeId` that list_categories filters on — and how an empty category list can be told apart from a tree ID that does not exist.",
+    parametersSchema: object({
+      treeIds: idArray("Return only these tree IDs.", 50),
+      channelIds: idArray("Return only the trees serving these storefront channel IDs.", 50),
+    }),
   },
   {
     name: TOOL_NAMES.listCategories,
@@ -291,7 +309,7 @@ export const TOOL_DECLARATIONS: readonly ToolDeclaration[] = [
     name: TOOL_NAMES.listInventory,
     displayName: "BigCommerce: list inventory",
     description:
-      "Read stock levels per location: available to sell, total on hand, quantity backordered, safety stock and in-stock status, filtered by SKU, product, variant or location. One row per SKU and location, so a SKU stocked in three warehouses returns three rows while `pagination` counts SKUs. Use this rather than a product's single `inventoryLevel` when the store ships from more than one location.",
+      "Read stock levels per location: available to sell, total on hand, quantity backordered, safety stock and in-stock status, filtered by SKU, product, variant or location. One row per SKU and location, so a SKU stocked in three warehouses returns three rows: `pagination.skusReturned` counts SKUs, which is what `limit`, `total` and `hasMore` are in, and `pagination.rowsReturned` counts rows. With `locationIds` set, every row returned is for one of those locations. Use this rather than a product's single `inventoryLevel` when the store ships from more than one location.",
     parametersSchema: object({
       skus: {
         type: "array",

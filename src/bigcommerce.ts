@@ -10,12 +10,16 @@
  */
 
 import {
+  API_ORIGIN_PATTERN,
   DEFAULT_API_ORIGIN,
+  LOOPBACK_SPELLINGS,
   PAGE_LIMIT_DEFAULT,
   PAGE_LIMIT_MAX,
   PAGE_MAX,
+  PRODUCT_SORT_FIELDS,
   REQUEST_TIMEOUT_MS,
   RESPONSE_LIMIT_BYTES,
+  SORT_DIRECTIONS,
   TOOL_NAMES,
 } from "./constants.js";
 import {
@@ -60,6 +64,13 @@ export function bigCommerceApiOrigin(origin?: string): string {
   if (raw === "") return DEFAULT_API_ORIGIN;
 
   const trimmed = raw.replace(/\/+$/, "");
+  // A port above 65535 makes `new URL` throw, and the generic "must be a full
+  // URL" below never mentions the port — so `http://localhost:99999` read as a
+  // malformed URL rather than as the one character that was wrong.
+  const port = /:(\d+)$/.exec(trimmed)?.[1];
+  if (port !== undefined && Number(port) > 65535) {
+    throw new BigCommerceError("The API origin's port must be between 1 and 65535.");
+  }
   // `new URL("api.bigcommerce.com")` throws, but `new URL("api:8443")` parses
   // as the scheme `api:` with an opaque path, so an origin that lost its
   // scheme has to be rejected explicitly rather than left to build a nonsense
@@ -91,6 +102,22 @@ export function bigCommerceApiOrigin(origin?: string): string {
   if (parsed.protocol === "http:" && !isLoopbackHost(parsed.hostname)) {
     throw new BigCommerceError(
       "The API origin must use https. Plain http is accepted only for a loopback address.",
+    );
+  }
+  // Last gate, and deliberately the same pattern the settings form is validated
+  // with, applied to the same thing the form sees: what the operator typed. The
+  // canonical form would not do — `new URL` turns `http://127.1` into
+  // `http://127.0.0.1`, so checking the canonical form would accept a spelling
+  // the form refuses, which is the disagreement this is here to remove.
+  //
+  // It runs last so the checks above keep their specific messages; what reaches
+  // it is a URL that is otherwise fine and simply written in a form the form
+  // would not have saved. The origin is not interpolated into the message:
+  // every error here can reach an agent transcript, and the configured origin
+  // is the one piece of the request URL an operator might not want echoed.
+  if (!new RegExp(API_ORIGIN_PATTERN).test(trimmed)) {
+    throw new BigCommerceError(
+      `The API origin is not in a form this plugin accepts. Write the host as a hostname or a bracketed IPv6 address, and a loopback address as one of ${LOOPBACK_SPELLINGS.join(", ")}.`,
     );
   }
   return `${parsed.protocol}//${parsed.host}`;
@@ -604,17 +631,12 @@ export async function executeTool(
       // unreachable. `/v2/orders` is the other way round, which is why this
       // tool's `sort` and list_orders' look different.
       const direction = optionalString(params, "direction", 4);
-      if (direction !== undefined && !["asc", "desc"].includes(direction)) {
-        throw new InvalidParameterError('"direction" must be asc or desc.');
+      if (direction !== undefined && !SORT_DIRECTIONS.includes(direction as never)) {
+        throw new InvalidParameterError(`"direction" must be ${SORT_DIRECTIONS.join(" or ")}.`);
       }
-      if (
-        sort !== undefined &&
-        !["id", "name", "sku", "price", "date_modified", "inventory_level", "total_sold"].includes(
-          sort,
-        )
-      ) {
+      if (sort !== undefined && !PRODUCT_SORT_FIELDS.includes(sort as never)) {
         throw new InvalidParameterError(
-          '"sort" must be one of id, name, sku, price, date_modified, inventory_level, total_sold.',
+          `"sort" must be one of ${PRODUCT_SORT_FIELDS.join(", ")}.`,
         );
       }
       const isVisible = optionalBoolean(params, "isVisible");
@@ -680,6 +702,35 @@ export async function executeTool(
       return { productId, pagination, variants: rows };
     }
 
+    case TOOL_NAMES.listCategoryTrees: {
+      rejectUnknownKeys(params, ["treeIds", "channelIds"]);
+      // No paging parameters: `/v3/catalog/trees` documents `id:in` and
+      // `channel_id:in` and nothing else, and sending `page`/`limit` to an
+      // endpoint that never promised them is how the old `list_categories`
+      // reported a `hasMore` it had invented. A store has one tree per
+      // storefront, so the whole list is one response.
+      const { rows } = await v3List(
+        options,
+        "/v3/catalog/trees",
+        withFilters(
+          {},
+          {
+            "id:in": optionalIdList(params, "treeIds", 50),
+            "channel_id:in": optionalIdList(params, "channelIds", 50),
+          },
+        ),
+        1,
+        PAGE_LIMIT_DEFAULT,
+      );
+      return {
+        trees: rows.map((tree) => ({
+          id: tree.id ?? null,
+          name: tree.name ?? null,
+          channelIds: Array.isArray(tree.channels) ? tree.channels : [],
+        })),
+      };
+    }
+
     case TOOL_NAMES.listCategories: {
       rejectUnknownKeys(params, ["treeId", "keyword", "parentId", "page", "limit"]);
       const { page, limit } = paging(params);
@@ -711,7 +762,15 @@ export async function executeTool(
       // so a row can say which storefront it belongs to. The same category
       // name exists in several trees on a multi-storefront store, and a bare
       // `tree_id` does not tell an agent which is which.
-      const treeNames = rows.length === 0 ? new Map() : await categoryTreeNames(options);
+      //
+      // It asks for exactly the trees on this page by ID. Asking for all of
+      // them let `treeName` come back null on a store with more trees than one
+      // default page — a missing name that looked like a store with unnamed
+      // trees rather than like a second page nobody fetched.
+      const treeIds = [
+        ...new Set(rows.map((row) => row.tree_id).filter((id): id is number => typeof id === "number")),
+      ];
+      const treeNames = treeIds.length === 0 ? new Map() : await categoryTreeNames(options, treeIds);
       return { pagination, categories: rows.map((row) => summarizeCategory(row, treeNames)) };
     }
 
@@ -851,6 +910,9 @@ export async function executeTool(
     case TOOL_NAMES.listInventory: {
       rejectUnknownKeys(params, ["skus", "productIds", "variantIds", "locationIds", "page", "limit"]);
       const { page, limit } = paging(params);
+      const requestedLocations = optionalIdList(params, "locationIds", 50)
+        ?.split(",")
+        .map(Number);
       const { rows, pagination } = await v3List(
         options,
         "/v3/inventory/items",
@@ -867,55 +929,84 @@ export async function executeTool(
       // and the per-location numbers live under `locations[].settings` as well
       // as on the location itself. Reading those eight fields off the top-level
       // object returned a row of nothing but nulls for every item in the store.
-      // One output row per SKU/location pair, so `pagination` counts SKUs while
-      // `items` can be longer — a multi-location store has several rows per SKU.
-      return {
-        pagination,
-        items: rows.flatMap((item) => {
-          const identity = asRow(item.identity);
-          const sku = { sku: identity.sku ?? null };
-          const ids = {
-            productId: identity.product_id ?? null,
-            variantId: identity.variant_id ?? null,
-          };
-          const locations = Array.isArray(item.locations) ? item.locations : [];
-          if (locations.length === 0) {
-            // An item with no location row has no stock numbers anywhere. Say
-            // that with one explicit row rather than dropping the SKU, so
-            // "which of these SKUs has no stock record" stays answerable.
-            return [
-              {
-                ...sku,
-                ...ids,
-                locationId: null,
-                locationCode: null,
-                locationName: null,
-                availableToSell: null,
-                totalInventoryOnhand: null,
-                qtyBackordered: null,
-                locationEnabled: null,
-                safetyStock: null,
-                isInStock: null,
-              },
-            ];
-          }
-          return locations.map(asRow).map((location) => {
-            const settings = asRow(location.settings);
-            return {
+      // One output row per SKU/location pair, so a multi-location store has
+      // several rows per SKU — see the pagination note below.
+      const items = rows.flatMap((item) => {
+        const identity = asRow(item.identity);
+        const sku = { sku: identity.sku ?? null };
+        const ids = {
+          productId: identity.product_id ?? null,
+          variantId: identity.variant_id ?? null,
+        };
+        const all = Array.isArray(item.locations) ? item.locations.map(asRow) : [];
+        // `location_id:in` goes to the API, but the spec only calls it "comma
+        // separated list of location_id" and never says whether it selects
+        // *items* or prunes each item's `locations[]` — and the endpoint
+        // summary ("all items in all locations") leans toward selecting items.
+        // If it selects, a request for Dallas returns the Dallas-stocked SKU
+        // with its Austin row attached, and an agent asked "how many in
+        // Dallas" reads the Austin number and reports it as Dallas. That is a
+        // wrong number with nothing in the output to reveal it, so the rows are
+        // narrowed here as well. Correct under either reading of the filter.
+        const locations =
+          requestedLocations === undefined
+            ? all
+            : all.filter(
+                (location) =>
+                  typeof location.location_id === "number" &&
+                  requestedLocations.includes(location.location_id),
+              );
+        if (locations.length === 0) {
+          // A SKU the filter matched but with no location row left has no
+          // stock numbers to report. Dropping it would answer "which of these
+          // SKUs has no stock record at all" with silence, so say it with one
+          // explicit row — except when the caller named locations, where a SKU
+          // stocked only elsewhere is simply not part of the answer.
+          if (requestedLocations !== undefined && all.length > 0) return [];
+          return [
+            {
               ...sku,
               ...ids,
-              locationId: location.location_id ?? null,
-              locationCode: location.location_code ?? null,
-              locationName: location.location_name ?? null,
-              availableToSell: location.available_to_sell ?? null,
-              totalInventoryOnhand: location.total_inventory_onhand ?? null,
-              qtyBackordered: location.qty_backordered ?? null,
-              locationEnabled: location.location_enabled ?? null,
-              safetyStock: settings.safety_stock ?? null,
-              isInStock: settings.is_in_stock ?? null,
-            };
-          });
-        }),
+              locationId: null,
+              locationCode: null,
+              locationName: null,
+              availableToSell: null,
+              totalInventoryOnhand: null,
+              qtyBackordered: null,
+              locationEnabled: null,
+              safetyStock: null,
+              isInStock: null,
+            },
+          ];
+        }
+        return locations.map((location) => {
+          const settings = asRow(location.settings);
+          return {
+            ...sku,
+            ...ids,
+            locationId: location.location_id ?? null,
+            locationCode: location.location_code ?? null,
+            locationName: location.location_name ?? null,
+            availableToSell: location.available_to_sell ?? null,
+            totalInventoryOnhand: location.total_inventory_onhand ?? null,
+            qtyBackordered: location.qty_backordered ?? null,
+            locationEnabled: location.location_enabled ?? null,
+            safetyStock: settings.safety_stock ?? null,
+            isInStock: settings.is_in_stock ?? null,
+          };
+        });
+      });
+      // `returned` means "rows in this response" in every other list tool, and
+      // here one page of SKUs is a different number of rows. Reporting it as
+      // `returned` invited comparing it to `limit` — `limit: 2` over SKUs with
+      // three and two locations gives five rows — and concluding the page was
+      // past the end. Two named counts instead: `skusReturned` is the unit
+      // `limit`, `total` and `hasMore` are all in, `rowsReturned` is
+      // `items.length`.
+      const { returned: skusReturned, ...rest } = pagination;
+      return {
+        pagination: { ...rest, skusReturned, rowsReturned: items.length },
+        items,
       };
     }
 
@@ -957,13 +1048,21 @@ export async function executeTool(
 /**
  * Map category tree IDs to their names.
  *
- * `/v3/catalog/trees` documents only `id:in` and `channel_id:in`, so it is
- * called with no query at all rather than with paging parameters it never
- * promised to accept. A store has one tree per storefront channel, so the
- * whole list arrives in one page.
+ * `/v3/catalog/trees` documents only `id:in` and `channel_id:in` — no paging —
+ * so it is asked for the specific trees wanted rather than for all of them and
+ * a hope that they fit in one response.
  */
-async function categoryTreeNames(options: ClientOptions): Promise<Map<number, unknown>> {
-  const { rows } = await v3List(options, "/v3/catalog/trees", {}, 1, PAGE_LIMIT_DEFAULT);
+async function categoryTreeNames(
+  options: ClientOptions,
+  treeIds: readonly number[],
+): Promise<Map<number, unknown>> {
+  const { rows } = await v3List(
+    options,
+    "/v3/catalog/trees",
+    { "id:in": treeIds.join(",") },
+    1,
+    PAGE_LIMIT_DEFAULT,
+  );
   const names = new Map<number, unknown>();
   for (const tree of rows) {
     if (typeof tree.id === "number") names.set(tree.id, tree.name ?? null);

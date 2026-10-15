@@ -10,32 +10,58 @@
  *
  * So these tests have one source of truth that the implementation cannot
  * influence: `openapi-contract.json`, generated from BigCommerce's own
- * machine-readable specs by `scripts/sync-openapi-contract.mjs`. Three things
+ * machine-readable specs by `scripts/sync-openapi-contract.mjs`. Four things
  * are checked against it:
  *
  *  1. every query parameter this plugin sends is documented for the endpoint
  *     it is sent to, and every path it requests is an endpoint that exists;
  *  2. every property name in `openapi-fixtures.json` appears in the response
  *     schema it claims to come from, so a fixture cannot drift into the shape
- *     the code happens to want;
- *  3. the paging ceiling this plugin enforces is within the documented one.
+ *     the code happens to want — including at nesting levels the generator
+ *     records no properties for, which are a failure rather than a skip;
+ *  3. where a parameter's documented values are authoritative, the allowlist
+ *     this plugin enforces matches them;
+ *  4. the paging ceiling this plugin enforces is within the documented one.
  *
- * All three would have failed on the original `list_categories`,
+ * Checks 1, 2 and 4 would all have failed on the original `list_categories`,
  * `list_inventory` and `list_locations`.
+ *
+ * What this guard still cannot see, so that nobody reads more into a green run
+ * than it earned:
+ *
+ *  - whether a filter is *applied*. It checks that `location_id:in` is a
+ *    documented parameter, not that the rows coming back are narrowed by it.
+ *  - which field the code reads a value *from*. Reading `location_name` into
+ *    `locationCode` satisfies every check here.
+ *  - a property the response has and the plugin never maps.
+ *  - semantics of any kind: units, currency, timezone, whether `total` counts
+ *    SKUs or rows.
+ *  - spec drift. A changed `sha256` is visible only when somebody re-runs
+ *    `npm run sync-contract`; nothing prompts that.
+ *
+ * Parameter *values* are checked only where the spec's own enum is consistent
+ * with its description — see `AUTHORITATIVE_ENUMS` for the counter-example
+ * that stopped this being a blanket rule.
  */
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { executeTool, type ClientOptions } from "../src/bigcommerce.js";
-import { PAGE_LIMIT_MAX, TOOL_NAMES } from "../src/constants.js";
+import {
+  PAGE_LIMIT_MAX,
+  PRODUCT_SORT_FIELDS,
+  SORT_DIRECTIONS,
+  TOOL_NAMES,
+} from "../src/constants.js";
 
 interface Contract {
   specs: Record<string, { url: string; sha256: string }>;
+  maxDepth: number;
   endpoints: Record<
     string,
     {
       spec: string;
       specPath: string;
-      queryParameters: Record<string, { maximum?: number }>;
+      queryParameters: Record<string, { maximum?: number; enum?: string[] }>;
       responseProperties: Record<string, string[]>;
     }
   >;
@@ -122,6 +148,7 @@ const INVOCATIONS: Array<{ tool: string; params: Record<string, unknown> }> = [
     params: { productId: 42, include: ["variants", "images"] },
   },
   { tool: TOOL_NAMES.listProductVariants, params: { productId: 42, page: 1, limit: 10 } },
+  { tool: TOOL_NAMES.listCategoryTrees, params: { treeIds: [1, 2], channelIds: [1] } },
   {
     tool: TOOL_NAMES.listCategories,
     params: { treeId: 1, parentId: 0, keyword: "wrench", page: 1, limit: 20 },
@@ -211,6 +238,37 @@ describe("requests match the published endpoints", () => {
     });
   }
 
+  /**
+   * Where the plugin keeps its own allowlist of a parameter's values, that list
+   * has to be the spec's enum — a hand-picked subset silently refuses filters
+   * BigCommerce supports, which is how `list_products` came to offer 7 of 13
+   * sort fields and omit the two an agent would reach for first.
+   *
+   * This is not applied to every enum in the contract, because the specs
+   * contradict themselves in at least one place: `/v2/orders` lists bare field
+   * names in its `sort` enum while the same parameter's description requires
+   * the `:asc`/`:desc` suffix the plugin sends. Checking that one against its
+   * enum would fail a request that is right. So the rule is opt-in, and each
+   * entry here is a parameter whose enum was read and found consistent with its
+   * own description.
+   */
+  const AUTHORITATIVE_ENUMS: Array<{
+    path: string;
+    parameter: string;
+    allowed: readonly string[];
+  }> = [
+    { path: "/v3/catalog/products", parameter: "sort", allowed: PRODUCT_SORT_FIELDS },
+    { path: "/v3/catalog/products", parameter: "direction", allowed: SORT_DIRECTIONS },
+  ];
+
+  for (const { path, parameter, allowed } of AUTHORITATIVE_ENUMS) {
+    it(`accepts exactly the documented ${parameter} values for ${path}`, () => {
+      const documented = contract.endpoints[path]?.queryParameters[parameter]?.enum;
+      expect(documented, `${parameter} has no documented enum for ${path}`).toBeDefined();
+      expect([...allowed].sort()).toEqual(documented);
+    });
+  }
+
   it("keeps its paging ceiling inside the documented one", () => {
     const documented = Object.entries(contract.endpoints).flatMap(([path, endpoint]) => {
       const maximum = endpoint.queryParameters.limit?.maximum;
@@ -238,9 +296,18 @@ describe("fixtures match the published response schemas", () => {
     }
     if (value === null || typeof value !== "object") return;
     const documented = properties[pointer];
-    // Only check where the spec documents the level; it stops nesting before
-    // some leaf objects do, and inventing a rule there would be noise.
-    if (documented === undefined) return;
+    // An undocumented *level* used to return here, which made the whole check
+    // blind below `data[].locations[]` — the exact depth the `list_inventory`
+    // defect lived at. A fixture could invent an object there and pass. So an
+    // unrecorded level is now a failure in its own right: either BigCommerce
+    // does not document that object, or the fixture nests deeper than
+    // `maxDepth` records and the generator needs to reach further.
+    if (documented === undefined) {
+      report(
+        `${path}: nothing is documented at "${pointer || "(root)"}", so its properties are unchecked`,
+      );
+      return;
+    }
     for (const [name, child] of Object.entries(value as Record<string, unknown>)) {
       if (!documented.includes(name)) {
         report(`${path}: "${name}" is not documented at "${pointer || "(root)"}"`);

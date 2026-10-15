@@ -1,5 +1,11 @@
 import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
-import { CONFIG_KEYS, DEFAULT_API_ORIGIN, PLUGIN_ID, PLUGIN_VERSION } from "./constants.js";
+import {
+  API_ORIGIN_PATTERN,
+  CONFIG_KEYS,
+  DEFAULT_API_ORIGIN,
+  PLUGIN_ID,
+  PLUGIN_VERSION,
+} from "./constants.js";
 import { TOOL_DECLARATIONS } from "./tools.js";
 
 /**
@@ -74,8 +80,11 @@ const manifest: PaperclipPluginManifestV1 = {
         // against this schema and nothing else. Without the restriction here,
         // `http://api.bigcommerce.com` saved green and then failed every tool
         // call at request time: a dead config rather than a refused one.
-        pattern:
-          "^$|^https://[^\\s/?#@]+/*$|^http://(localhost|127(\\.\\d{1,3}){3}|\\[::1\\])(:\\d{1,5})?/*$",
+        //
+        // The same constant is what `bigCommerceApiOrigin` enforces at request
+        // time, so the form and the worker cannot disagree about what is
+        // acceptable — see API_ORIGIN_PATTERN for the six ways they used to.
+        pattern: API_ORIGIN_PATTERN,
       },
     },
     required: [CONFIG_KEYS.storeHash, CONFIG_KEYS.accessToken],

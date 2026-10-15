@@ -156,12 +156,33 @@ describe("instance config schema", () => {
       expect(withOrigin("")).toBe(true);
     });
 
+    /**
+     * `[input, what the request builder makes of it]`.
+     *
+     * The last three are here because the form used to be *stricter* than the
+     * worker, and the host reports that as the opaque "Configuration does not
+     * match the plugin's instanceConfigSchema". Pasting a value with a trailing
+     * space, or typing a scheme or hostname in capitals, is ordinary; the worker
+     * trims and `new URL` lowercases both, so refusing them at the form was a
+     * dead end with no explanation attached.
+     */
     const ACCEPTED = [
-      ["the default origin", "https://api.bigcommerce.com"],
-      ["an origin pasted with a trailing slash", "https://api.bigcommerce.com/"],
-      ["an IPv4 loopback mock", "http://127.0.0.1:8080"],
-      ["a localhost mock", "http://localhost:3000"],
-      ["an IPv6 loopback mock", "http://[::1]:3000"],
+      ["the default origin", "https://api.bigcommerce.com", "https://api.bigcommerce.com"],
+      [
+        "an origin pasted with a trailing slash",
+        "https://api.bigcommerce.com/",
+        "https://api.bigcommerce.com",
+      ],
+      ["an IPv4 loopback mock", "http://127.0.0.1:8080", "http://127.0.0.1:8080"],
+      ["a localhost mock", "http://localhost:3000", "http://localhost:3000"],
+      ["an IPv6 loopback mock", "http://[::1]:3000", "http://[::1]:3000"],
+      [
+        "an origin pasted with surrounding whitespace",
+        "  https://api.bigcommerce.com  ",
+        "https://api.bigcommerce.com",
+      ],
+      ["an uppercase hostname", "http://LOCALHOST:3000", "http://localhost:3000"],
+      ["an uppercase scheme", "HTTPS://api.bigcommerce.com", "https://api.bigcommerce.com"],
     ] as const;
 
     it.each(ACCEPTED)("accepts %s", (_label, origin) => {
@@ -173,9 +194,30 @@ describe("instance config schema", () => {
       ["a path", "https://api.bigcommerce.com/stores"],
       ["embedded credentials", "https://u:p@api.bigcommerce.com"],
       ["a query string", "https://api.bigcommerce.com?x=1"],
-      ["whitespace", "https://api.bigcommerce.com "],
     ])("rejects %s", (_label, origin) => {
       expect(withOrigin(origin)).toBe(false);
+    });
+
+    /**
+     * The other direction of the same drift: these used to save green and then
+     * fail every tool call, because the pattern was looser than the worker.
+     *
+     * `http://localhost:99999` is the clearest case — above 65535 `new URL`
+     * throws, so the stored config was dead and the error said "must be a full
+     * URL" without mentioning the port. The two non-canonical loopback
+     * spellings are the opposite: `new URL` canonicalizes both to loopback and
+     * the worker accepted them, but no pattern can enumerate every spelling of
+     * 127.0.0.1 (`http://2130706433` is one), so both layers now refuse them
+     * and the worker's message names the three that work.
+     */
+    it.each([
+      ["a port above 65535", "http://localhost:99999"],
+      ["IPv4 loopback shorthand", "http://127.1"],
+      ["loopback as an integer", "http://2130706433"],
+      ["uncompressed IPv6 loopback", "http://[0:0:0:0:0:0:0:1]"],
+    ])("rejects %s at the form and at request time alike", (_label, origin) => {
+      expect(withOrigin(origin)).toBe(false);
+      expect(() => bigCommerceApiOrigin(origin)).toThrow();
     });
 
     /**
@@ -200,10 +242,12 @@ describe("instance config schema", () => {
      * and the builder is the one that runs on stored config that may predate
      * the field. They have to agree in both directions: anything the form
      * accepts must survive the builder, and anything the builder refuses must
-     * never have been savable.
+     * never have been savable. Both layers now test the same pattern constant,
+     * so the remaining job of this test is the normalization: what the builder
+     * turns each accepted value into.
      */
-    it.each(ACCEPTED)("agrees with the request builder about %s", (_label, origin) => {
-      expect(bigCommerceApiOrigin(origin)).toBe(origin.replace(/\/+$/, ""));
+    it.each(ACCEPTED)("agrees with the request builder about %s", (_label, origin, canonical) => {
+      expect(bigCommerceApiOrigin(origin)).toBe(canonical);
     });
   });
 

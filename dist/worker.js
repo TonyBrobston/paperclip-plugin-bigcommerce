@@ -42041,12 +42041,20 @@ function startWorkerRpcHost(options) {
 
 // src/constants.ts
 var DEFAULT_API_ORIGIN = "https://api.bigcommerce.com";
+var ORIGIN_HOST = "(?:[A-Za-z0-9._-]+|\\[[0-9A-Fa-f:]+\\])";
+var ORIGIN_LOOPBACK = "(?:[Ll][Oo][Cc][Aa][Ll][Hh][Oo][Ss][Tt]|127(?:\\.(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])){3}|\\[::1\\])";
+var ORIGIN_PORT = "(?::(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|65[0-5][0-9]|6553[0-5]))?";
+var ORIGIN_HTTPS = "[Hh][Tt][Tt][Pp][Ss]";
+var ORIGIN_HTTP = "[Hh][Tt][Tt][Pp]";
+var API_ORIGIN_PATTERN = `^\\s*$|^\\s*${ORIGIN_HTTPS}://${ORIGIN_HOST}${ORIGIN_PORT}/*\\s*$|^\\s*${ORIGIN_HTTP}://${ORIGIN_LOOPBACK}${ORIGIN_PORT}/*\\s*$`;
+var LOOPBACK_SPELLINGS = ["localhost", "127.0.0.1", "[::1]"];
 var TOOL_NAMES = {
   getStoreInfo: "get_store_info",
   getCatalogSummary: "get_catalog_summary",
   listProducts: "list_products",
   getProduct: "get_product",
   listProductVariants: "list_product_variants",
+  listCategoryTrees: "list_category_trees",
   listCategories: "list_categories",
   listBrands: "list_brands",
   listOrders: "list_orders",
@@ -42058,6 +42066,22 @@ var TOOL_NAMES = {
 };
 var PAGE_LIMIT_MAX = 250;
 var PAGE_LIMIT_DEFAULT = 50;
+var PRODUCT_SORT_FIELDS = [
+  "available_to_sell",
+  "backorder_limit",
+  "calculated_price",
+  "date_last_imported",
+  "date_modified",
+  "id",
+  "inventory_level",
+  "is_visible",
+  "name",
+  "price",
+  "qty_backordered",
+  "sku",
+  "total_sold"
+];
+var SORT_DIRECTIONS = ["asc", "desc"];
 var PAGE_MAX = 1e3;
 var RESPONSE_LIMIT_BYTES = 8 * 1024 * 1024;
 var REQUEST_TIMEOUT_MS = 3e4;
@@ -42173,6 +42197,10 @@ function bigCommerceApiOrigin(origin) {
   const raw = (origin ?? "").trim();
   if (raw === "") return DEFAULT_API_ORIGIN;
   const trimmed = raw.replace(/\/+$/, "");
+  const port = /:(\d+)$/.exec(trimmed)?.[1];
+  if (port !== void 0 && Number(port) > 65535) {
+    throw new BigCommerceError("The API origin's port must be between 1 and 65535.");
+  }
   let parsed;
   try {
     parsed = new URL(trimmed);
@@ -42200,6 +42228,11 @@ function bigCommerceApiOrigin(origin) {
   if (parsed.protocol === "http:" && !isLoopbackHost2(parsed.hostname)) {
     throw new BigCommerceError(
       "The API origin must use https. Plain http is accepted only for a loopback address."
+    );
+  }
+  if (!new RegExp(API_ORIGIN_PATTERN).test(trimmed)) {
+    throw new BigCommerceError(
+      `The API origin is not in a form this plugin accepts. Write the host as a hostname or a bracketed IPv6 address, and a loopback address as one of ${LOOPBACK_SPELLINGS.join(", ")}.`
     );
   }
   return `${parsed.protocol}//${parsed.host}`;
@@ -42546,14 +42579,12 @@ async function executeTool(options, toolName, parameters) {
       const { page: page2, limit } = paging(params);
       const sort = optionalString(params, "sort", 32);
       const direction = optionalString(params, "direction", 4);
-      if (direction !== void 0 && !["asc", "desc"].includes(direction)) {
-        throw new InvalidParameterError('"direction" must be asc or desc.');
+      if (direction !== void 0 && !SORT_DIRECTIONS.includes(direction)) {
+        throw new InvalidParameterError(`"direction" must be ${SORT_DIRECTIONS.join(" or ")}.`);
       }
-      if (sort !== void 0 && !["id", "name", "sku", "price", "date_modified", "inventory_level", "total_sold"].includes(
-        sort
-      )) {
+      if (sort !== void 0 && !PRODUCT_SORT_FIELDS.includes(sort)) {
         throw new InvalidParameterError(
-          '"sort" must be one of id, name, sku, price, date_modified, inventory_level, total_sold.'
+          `"sort" must be one of ${PRODUCT_SORT_FIELDS.join(", ")}.`
         );
       }
       const isVisible = optionalBoolean(params, "isVisible");
@@ -42616,6 +42647,29 @@ async function executeTool(options, toolName, parameters) {
       );
       return { productId, pagination, variants: rows };
     }
+    case TOOL_NAMES.listCategoryTrees: {
+      rejectUnknownKeys(params, ["treeIds", "channelIds"]);
+      const { rows } = await v3List(
+        options,
+        "/v3/catalog/trees",
+        withFilters(
+          {},
+          {
+            "id:in": optionalIdList(params, "treeIds", 50),
+            "channel_id:in": optionalIdList(params, "channelIds", 50)
+          }
+        ),
+        1,
+        PAGE_LIMIT_DEFAULT
+      );
+      return {
+        trees: rows.map((tree) => ({
+          id: tree.id ?? null,
+          name: tree.name ?? null,
+          channelIds: Array.isArray(tree.channels) ? tree.channels : []
+        }))
+      };
+    }
     case TOOL_NAMES.listCategories: {
       rejectUnknownKeys(params, ["treeId", "keyword", "parentId", "page", "limit"]);
       const { page: page2, limit } = paging(params);
@@ -42631,7 +42685,10 @@ async function executeTool(options, toolName, parameters) {
         page2,
         limit
       );
-      const treeNames = rows.length === 0 ? /* @__PURE__ */ new Map() : await categoryTreeNames(options);
+      const treeIds = [
+        ...new Set(rows.map((row) => row.tree_id).filter((id) => typeof id === "number"))
+      ];
+      const treeNames = treeIds.length === 0 ? /* @__PURE__ */ new Map() : await categoryTreeNames(options, treeIds);
       return { pagination, categories: rows.map((row) => summarizeCategory(row, treeNames)) };
     }
     case TOOL_NAMES.listBrands: {
@@ -42762,6 +42819,7 @@ async function executeTool(options, toolName, parameters) {
     case TOOL_NAMES.listInventory: {
       rejectUnknownKeys(params, ["skus", "productIds", "variantIds", "locationIds", "page", "limit"]);
       const { page: page2, limit } = paging(params);
+      const requestedLocations = optionalIdList(params, "locationIds", 50)?.split(",").map(Number);
       const { rows, pagination } = await v3List(
         options,
         "/v3/inventory/items",
@@ -42774,50 +42832,56 @@ async function executeTool(options, toolName, parameters) {
         page2,
         limit
       );
-      return {
-        pagination,
-        items: rows.flatMap((item) => {
-          const identity = asRow(item.identity);
-          const sku = { sku: identity.sku ?? null };
-          const ids = {
-            productId: identity.product_id ?? null,
-            variantId: identity.variant_id ?? null
-          };
-          const locations = Array.isArray(item.locations) ? item.locations : [];
-          if (locations.length === 0) {
-            return [
-              {
-                ...sku,
-                ...ids,
-                locationId: null,
-                locationCode: null,
-                locationName: null,
-                availableToSell: null,
-                totalInventoryOnhand: null,
-                qtyBackordered: null,
-                locationEnabled: null,
-                safetyStock: null,
-                isInStock: null
-              }
-            ];
-          }
-          return locations.map(asRow).map((location) => {
-            const settings = asRow(location.settings);
-            return {
+      const items = rows.flatMap((item) => {
+        const identity = asRow(item.identity);
+        const sku = { sku: identity.sku ?? null };
+        const ids = {
+          productId: identity.product_id ?? null,
+          variantId: identity.variant_id ?? null
+        };
+        const all = Array.isArray(item.locations) ? item.locations.map(asRow) : [];
+        const locations = requestedLocations === void 0 ? all : all.filter(
+          (location) => typeof location.location_id === "number" && requestedLocations.includes(location.location_id)
+        );
+        if (locations.length === 0) {
+          if (requestedLocations !== void 0 && all.length > 0) return [];
+          return [
+            {
               ...sku,
               ...ids,
-              locationId: location.location_id ?? null,
-              locationCode: location.location_code ?? null,
-              locationName: location.location_name ?? null,
-              availableToSell: location.available_to_sell ?? null,
-              totalInventoryOnhand: location.total_inventory_onhand ?? null,
-              qtyBackordered: location.qty_backordered ?? null,
-              locationEnabled: location.location_enabled ?? null,
-              safetyStock: settings.safety_stock ?? null,
-              isInStock: settings.is_in_stock ?? null
-            };
-          });
-        })
+              locationId: null,
+              locationCode: null,
+              locationName: null,
+              availableToSell: null,
+              totalInventoryOnhand: null,
+              qtyBackordered: null,
+              locationEnabled: null,
+              safetyStock: null,
+              isInStock: null
+            }
+          ];
+        }
+        return locations.map((location) => {
+          const settings = asRow(location.settings);
+          return {
+            ...sku,
+            ...ids,
+            locationId: location.location_id ?? null,
+            locationCode: location.location_code ?? null,
+            locationName: location.location_name ?? null,
+            availableToSell: location.available_to_sell ?? null,
+            totalInventoryOnhand: location.total_inventory_onhand ?? null,
+            qtyBackordered: location.qty_backordered ?? null,
+            locationEnabled: location.location_enabled ?? null,
+            safetyStock: settings.safety_stock ?? null,
+            isInStock: settings.is_in_stock ?? null
+          };
+        });
+      });
+      const { returned: skusReturned, ...rest } = pagination;
+      return {
+        pagination: { ...rest, skusReturned, rowsReturned: items.length },
+        items
       };
     }
     case TOOL_NAMES.listLocations: {
@@ -42853,8 +42917,14 @@ async function executeTool(options, toolName, parameters) {
       throw new BigCommerceError(`Unknown BigCommerce tool: ${toolName}`);
   }
 }
-async function categoryTreeNames(options) {
-  const { rows } = await v3List(options, "/v3/catalog/trees", {}, 1, PAGE_LIMIT_DEFAULT);
+async function categoryTreeNames(options, treeIds) {
+  const { rows } = await v3List(
+    options,
+    "/v3/catalog/trees",
+    { "id:in": treeIds.join(",") },
+    1,
+    PAGE_LIMIT_DEFAULT
+  );
   const names = /* @__PURE__ */ new Map();
   for (const tree of rows) {
     if (typeof tree.id === "number") names.set(tree.id, tree.name ?? null);
@@ -42979,12 +43049,12 @@ var TOOL_DECLARATIONS = [
       },
       sort: {
         type: "string",
-        enum: ["id", "name", "sku", "price", "date_modified", "inventory_level", "total_sold"],
-        description: "Field to sort by."
+        enum: [...PRODUCT_SORT_FIELDS],
+        description: "Field to sort by. calculated_price is the price a shopper would pay and available_to_sell is sellable stock, which are usually the two worth sorting on."
       },
       direction: {
         type: "string",
-        enum: ["asc", "desc"],
+        enum: [...SORT_DIRECTIONS],
         description: "Sort direction (default asc). Use sort=date_modified with direction=desc for the most recently changed products."
       },
       ...paging2
@@ -43029,6 +43099,15 @@ var TOOL_DECLARATIONS = [
       },
       ["productId"]
     )
+  },
+  {
+    name: TOOL_NAMES.listCategoryTrees,
+    displayName: "BigCommerce: list category trees",
+    description: "List the store's category trees with their IDs, names and the storefront channels each serves. A store has one tree per storefront, so this is how a storefront name becomes the `treeId` that list_categories filters on \u2014 and how an empty category list can be told apart from a tree ID that does not exist.",
+    parametersSchema: object2({
+      treeIds: idArray("Return only these tree IDs.", 50),
+      channelIds: idArray("Return only the trees serving these storefront channel IDs.", 50)
+    })
   },
   {
     name: TOOL_NAMES.listCategories,
@@ -43160,7 +43239,7 @@ var TOOL_DECLARATIONS = [
   {
     name: TOOL_NAMES.listInventory,
     displayName: "BigCommerce: list inventory",
-    description: "Read stock levels per location: available to sell, total on hand, quantity backordered, safety stock and in-stock status, filtered by SKU, product, variant or location. One row per SKU and location, so a SKU stocked in three warehouses returns three rows while `pagination` counts SKUs. Use this rather than a product's single `inventoryLevel` when the store ships from more than one location.",
+    description: "Read stock levels per location: available to sell, total on hand, quantity backordered, safety stock and in-stock status, filtered by SKU, product, variant or location. One row per SKU and location, so a SKU stocked in three warehouses returns three rows: `pagination.skusReturned` counts SKUs, which is what `limit`, `total` and `hasMore` are in, and `pagination.rowsReturned` counts rows. With `locationIds` set, every row returned is for one of those locations. Use this rather than a product's single `inventoryLevel` when the store ships from more than one location.",
     parametersSchema: object2({
       skus: {
         type: "array",

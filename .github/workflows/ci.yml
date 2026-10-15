@@ -1,0 +1,79 @@
+# The four commands this repo is verified with, run on every push.
+#
+# They exist here because this plugin's first version shipped three broken
+# tools behind a green suite, and the fix for that was structural: fixtures
+# generated from BigCommerce's published specs, and a smoke test that drives
+# every tool. A guard nobody runs is not a guard, so it runs here.
+name: CI
+
+on:
+  push:
+  pull_request:
+  # The drift check only. Weekly, because a spec can change under a committed
+  # contract file and nothing else would ever ask.
+  schedule:
+    - cron: "17 13 * * 1"
+  workflow_dispatch:
+
+jobs:
+  verify:
+    name: typecheck, tests, build, smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run typecheck
+
+      - run: npm test
+
+      - run: npm run build
+
+      # dist/ is committed so an install needs no build step, which only works
+      # if it is current. A diff here means somebody changed src/ and did not
+      # rebuild.
+      - name: dist/ matches src/
+        run: |
+          if ! git diff --exit-code -- dist; then
+            echo "::error::dist/ is stale — run 'npm run build' and commit the result."
+            exit 1
+          fi
+
+      # Forks the built worker the way the host does and drives all 14 tools
+      # against a loopback stub. This is the step that would have caught the
+      # three endpoint defects.
+      - run: npm run smoke
+
+  spec-drift:
+    name: BigCommerce specs still match the committed contract
+    # Not on push: it reaches out to docs.bigcommerce.com, and a spec edit is
+    # news about BigCommerce rather than about the commit being pushed.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+
+      # Regenerates tests/openapi-contract.json from the live specs. The
+      # committed file records each spec's SHA-256, so any diff at all means
+      # BigCommerce edited a spec this plugin reads.
+      - run: npm run sync-contract
+
+      - name: contract file is unchanged
+        run: |
+          if ! git diff --exit-code -- tests/openapi-contract.json; then
+            echo "::error::BigCommerce changed a spec. Review the diff above, re-run 'npm run sync-contract' locally, and commit it with any code change it implies."
+            exit 1
+          fi

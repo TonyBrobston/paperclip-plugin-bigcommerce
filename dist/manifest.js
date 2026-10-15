@@ -2,12 +2,19 @@
 var PLUGIN_ID = "tbro.bigcommerce";
 var PLUGIN_VERSION = "0.1.0";
 var DEFAULT_API_ORIGIN = "https://api.bigcommerce.com";
+var ORIGIN_HOST = "(?:[A-Za-z0-9._-]+|\\[[0-9A-Fa-f:]+\\])";
+var ORIGIN_LOOPBACK = "(?:[Ll][Oo][Cc][Aa][Ll][Hh][Oo][Ss][Tt]|127(?:\\.(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])){3}|\\[::1\\])";
+var ORIGIN_PORT = "(?::(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|65[0-5][0-9]|6553[0-5]))?";
+var ORIGIN_HTTPS = "[Hh][Tt][Tt][Pp][Ss]";
+var ORIGIN_HTTP = "[Hh][Tt][Tt][Pp]";
+var API_ORIGIN_PATTERN = `^\\s*$|^\\s*${ORIGIN_HTTPS}://${ORIGIN_HOST}${ORIGIN_PORT}/*\\s*$|^\\s*${ORIGIN_HTTP}://${ORIGIN_LOOPBACK}${ORIGIN_PORT}/*\\s*$`;
 var TOOL_NAMES = {
   getStoreInfo: "get_store_info",
   getCatalogSummary: "get_catalog_summary",
   listProducts: "list_products",
   getProduct: "get_product",
   listProductVariants: "list_product_variants",
+  listCategoryTrees: "list_category_trees",
   listCategories: "list_categories",
   listBrands: "list_brands",
   listOrders: "list_orders",
@@ -19,6 +26,22 @@ var TOOL_NAMES = {
 };
 var PAGE_LIMIT_MAX = 250;
 var PAGE_LIMIT_DEFAULT = 50;
+var PRODUCT_SORT_FIELDS = [
+  "available_to_sell",
+  "backorder_limit",
+  "calculated_price",
+  "date_last_imported",
+  "date_modified",
+  "id",
+  "inventory_level",
+  "is_visible",
+  "name",
+  "price",
+  "qty_backordered",
+  "sku",
+  "total_sold"
+];
+var SORT_DIRECTIONS = ["asc", "desc"];
 var PAGE_MAX = 1e3;
 var RESPONSE_LIMIT_BYTES = 8 * 1024 * 1024;
 var CONFIG_KEYS = {
@@ -100,12 +123,12 @@ var TOOL_DECLARATIONS = [
       },
       sort: {
         type: "string",
-        enum: ["id", "name", "sku", "price", "date_modified", "inventory_level", "total_sold"],
-        description: "Field to sort by."
+        enum: [...PRODUCT_SORT_FIELDS],
+        description: "Field to sort by. calculated_price is the price a shopper would pay and available_to_sell is sellable stock, which are usually the two worth sorting on."
       },
       direction: {
         type: "string",
-        enum: ["asc", "desc"],
+        enum: [...SORT_DIRECTIONS],
         description: "Sort direction (default asc). Use sort=date_modified with direction=desc for the most recently changed products."
       },
       ...paging
@@ -150,6 +173,15 @@ var TOOL_DECLARATIONS = [
       },
       ["productId"]
     )
+  },
+  {
+    name: TOOL_NAMES.listCategoryTrees,
+    displayName: "BigCommerce: list category trees",
+    description: "List the store's category trees with their IDs, names and the storefront channels each serves. A store has one tree per storefront, so this is how a storefront name becomes the `treeId` that list_categories filters on \u2014 and how an empty category list can be told apart from a tree ID that does not exist.",
+    parametersSchema: object({
+      treeIds: idArray("Return only these tree IDs.", 50),
+      channelIds: idArray("Return only the trees serving these storefront channel IDs.", 50)
+    })
   },
   {
     name: TOOL_NAMES.listCategories,
@@ -281,7 +313,7 @@ var TOOL_DECLARATIONS = [
   {
     name: TOOL_NAMES.listInventory,
     displayName: "BigCommerce: list inventory",
-    description: "Read stock levels per location: available to sell, total on hand, quantity backordered, safety stock and in-stock status, filtered by SKU, product, variant or location. One row per SKU and location, so a SKU stocked in three warehouses returns three rows while `pagination` counts SKUs. Use this rather than a product's single `inventoryLevel` when the store ships from more than one location.",
+    description: "Read stock levels per location: available to sell, total on hand, quantity backordered, safety stock and in-stock status, filtered by SKU, product, variant or location. One row per SKU and location, so a SKU stocked in three warehouses returns three rows: `pagination.skusReturned` counts SKUs, which is what `limit`, `total` and `hasMore` are in, and `pagination.rowsReturned` counts rows. With `locationIds` set, every row returned is for one of those locations. Use this rather than a product's single `inventoryLevel` when the store ships from more than one location.",
     parametersSchema: object({
       skus: {
         type: "array",
@@ -368,7 +400,11 @@ var manifest = {
         // against this schema and nothing else. Without the restriction here,
         // `http://api.bigcommerce.com` saved green and then failed every tool
         // call at request time: a dead config rather than a refused one.
-        pattern: "^$|^https://[^\\s/?#@]+/*$|^http://(localhost|127(\\.\\d{1,3}){3}|\\[::1\\])(:\\d{1,5})?/*$"
+        //
+        // The same constant is what `bigCommerceApiOrigin` enforces at request
+        // time, so the form and the worker cannot disagree about what is
+        // acceptable — see API_ORIGIN_PATTERN for the six ways they used to.
+        pattern: API_ORIGIN_PATTERN
       }
     },
     required: [CONFIG_KEYS.storeHash, CONFIG_KEYS.accessToken]
