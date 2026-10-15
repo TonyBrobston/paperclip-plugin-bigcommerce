@@ -1,0 +1,398 @@
+{
+  "note": "Response bodies in the shape BigCommerce's published specs document, used by the unit tests, the contract test and the smoke test. Every property name here is checked against tests/openapi-contract.json by tests/openapi-contract.spec.ts, so a fixture cannot drift into the shape the implementation happens to expect. `source` names the schema the body was written from.",
+  "endpoints": {
+    "/v2/store": {
+      "source": "admin-management-store-information-v2.json#/components/schemas/StoreInformation",
+      "body": {
+        "id": "abc123",
+        "store_id": 123456,
+        "account_uuid": "7a2f2f2e-0000-4000-8000-000000000001",
+        "name": "Brobston Supply",
+        "domain": "shop.example.test",
+        "secure_url": "https://shop.example.test",
+        "status": "live",
+        "currency": "USD",
+        "currency_symbol": "$",
+        "weight_units": "LBS",
+        "dimension_units": "Inches",
+        "timezone": { "name": "America/Chicago", "raw_offset": -21600, "dst_offset": -18000 },
+        "language": "en",
+        "plan_name": "Standard",
+        "plan_level": "Standard",
+        "features": { "stencil_enabled": true, "multi_storefront_enabled": false }
+      }
+    },
+    "/v3/catalog/summary": {
+      "source": "admin-catalog-products.json#/paths/~1stores~1{store_hash}~1v3~1catalog~1summary/get/responses/200",
+      "body": {
+        "data": {
+          "inventory_count": 412,
+          "inventory_value": 51234.5,
+          "variant_count": 980,
+          "primary_category_id": 23,
+          "primary_category_name": "Shop All",
+          "lowest_variant_price": 3.5,
+          "highest_variant_price": 899,
+          "average_variant_price": 42.75,
+          "oldest_variant_date": "2024-02-01T00:00:00Z",
+          "newest_variant_date": "2026-10-10T12:00:00Z"
+        },
+        "meta": {}
+      }
+    },
+    "/v3/catalog/products": {
+      "source": "admin-catalog-products.json#/components/schemas/productCollectionResponse",
+      "body": {
+        "data": [
+          {
+            "id": 42,
+            "name": "Pipe Wrench 14\"",
+            "sku": "PW-14",
+            "type": "physical",
+            "price": 24.99,
+            "sale_price": 19.99,
+            "inventory_level": 6,
+            "inventory_tracking": "variant",
+            "is_visible": true,
+            "brand_id": 3,
+            "categories": [23, 31],
+            "date_modified": "2026-10-10T12:00:00Z"
+          }
+        ],
+        "meta": { "pagination": { "total": 412, "count": 1, "per_page": 50, "current_page": 1, "total_pages": 9 } }
+      }
+    },
+    "/v3/catalog/products/{product_id}": {
+      "source": "admin-catalog-products.json#/components/schemas/productResponse",
+      "body": {
+        "data": {
+          "id": 42,
+          "name": "Pipe Wrench 14\"",
+          "sku": "PW-14",
+          "type": "physical",
+          "description": "<p>Cast iron pipe wrench.</p>",
+          "price": 24.99,
+          "weight": 4.2,
+          "inventory_level": 6,
+          "inventory_tracking": "variant",
+          "is_visible": true,
+          "brand_id": 3,
+          "categories": [23, 31],
+          "custom_url": { "url": "/pipe-wrench-14/", "is_customized": false },
+          "date_modified": "2026-10-10T12:00:00Z"
+        },
+        "meta": {}
+      }
+    },
+    "/v3/catalog/products/{product_id}/variants": {
+      "source": "admin-catalog-product-variants.json#/components/schemas/variantCollectionResponse",
+      "body": {
+        "data": [
+          {
+            "id": 77,
+            "product_id": 42,
+            "sku": "PW-14-RED",
+            "sku_id": 1,
+            "price": 26,
+            "sale_price": null,
+            "inventory_level": 4,
+            "option_values": [
+              { "id": 9, "label": "Red", "option_id": 5, "option_display_name": "Colour" }
+            ]
+          }
+        ],
+        "meta": { "pagination": { "total": 1, "count": 1, "per_page": 50, "current_page": 1, "total_pages": 1 } }
+      }
+    },
+    "/v3/catalog/trees": {
+      "source": "admin-catalog-category-trees.json#/components/schemas/CategoryTreeList",
+      "body": {
+        "data": [
+          { "id": 1, "name": "Storefront", "channels": [1] },
+          { "id": 2, "name": "Wholesale", "channels": [2] }
+        ],
+        "meta": { "pagination": { "total": 2, "count": 2, "per_page": 50, "current_page": 1, "total_pages": 1 } }
+      }
+    },
+    "/v3/catalog/trees/categories": {
+      "source": "admin-catalog-category-trees.json#/components/schemas/CategoryList",
+      "body": {
+        "data": [
+          {
+            "category_id": 23,
+            "category_uuid": "1f0d6a52-0000-4000-8000-000000000023",
+            "tree_id": 1,
+            "parent_id": 0,
+            "name": "Tools",
+            "is_visible": true,
+            "sort_order": 1,
+            "url": { "path": "/tools/", "is_customized": false }
+          },
+          {
+            "category_id": 31,
+            "category_uuid": "1f0d6a52-0000-4000-8000-000000000031",
+            "tree_id": 1,
+            "parent_id": 23,
+            "name": "Wrenches",
+            "is_visible": true,
+            "sort_order": 2,
+            "url": { "path": "/tools/wrenches/", "is_customized": false }
+          },
+          {
+            "category_id": 37,
+            "category_uuid": "1f0d6a52-0000-4000-8000-000000000037",
+            "tree_id": 1,
+            "parent_id": 31,
+            "name": "Pipe Wrenches",
+            "is_visible": false,
+            "sort_order": 3,
+            "url": { "path": "/tools/wrenches/pipe/", "is_customized": false }
+          },
+          {
+            "category_id": 44,
+            "category_uuid": "1f0d6a52-0000-4000-8000-000000000044",
+            "tree_id": 2,
+            "parent_id": 0,
+            "name": "Bulk",
+            "is_visible": true,
+            "sort_order": 1,
+            "url": { "path": "/bulk/", "is_customized": false }
+          }
+        ],
+        "meta": { "pagination": { "total": 4, "count": 4, "per_page": 50, "current_page": 1, "total_pages": 1 } }
+      }
+    },
+    "/v3/catalog/brands": {
+      "source": "admin-catalog-brands.json — GET /v3/catalog/brands",
+      "body": {
+        "data": [
+          {
+            "id": 3,
+            "name": "Ridgid",
+            "page_title": "Ridgid tools",
+            "custom_url": { "url": "/ridgid/", "is_customized": false }
+          }
+        ],
+        "meta": { "pagination": { "total": 1, "count": 1, "per_page": 50, "current_page": 1, "total_pages": 1 } }
+      }
+    },
+    "/v2/orders": {
+      "source": "admin-management-orders.json — GET /v2/orders, an array of order records",
+      "body": [
+        {
+          "id": 1042,
+          "status": "Shipped",
+          "status_id": 2,
+          "date_created": "Mon, 12 Oct 2026 10:00:00 +0000",
+          "date_modified": "Tue, 13 Oct 2026 08:30:00 +0000",
+          "customer_id": 55,
+          "items_total": 3,
+          "items_shipped": 3,
+          "subtotal_inc_tax": "118.4000",
+          "total_inc_tax": "128.4000",
+          "currency_code": "USD",
+          "payment_method": "Credit Card",
+          "payment_status": "captured",
+          "billing_address": {
+            "first_name": "Ada",
+            "last_name": "Byron",
+            "street_1": "1 Analytical Way",
+            "city": "Dallas",
+            "state": "Texas",
+            "zip": "75201",
+            "country": "United States",
+            "country_iso2": "US",
+            "email": "buyer@example.test",
+            "phone": "555-0100"
+          }
+        }
+      ]
+    },
+    "/v2/orders/{order_id}": {
+      "source": "admin-management-orders.json — GET /v2/orders/{order_id}, one order record",
+      "body": {
+        "id": 1042,
+        "status": "Shipped",
+        "status_id": 2,
+        "order_source": "www",
+        "channel_id": 1,
+        "is_deleted": false,
+        "date_created": "Mon, 12 Oct 2026 10:00:00 +0000",
+        "date_modified": "Tue, 13 Oct 2026 08:30:00 +0000",
+        "date_shipped": "Tue, 13 Oct 2026 08:30:00 +0000",
+        "customer_id": 55,
+        "customer_message": "Please leave at the loading dock.",
+        "staff_notes": "Called the customer about the backorder.",
+        "items_total": 3,
+        "items_shipped": 3,
+        "order_is_digital": false,
+        "currency_code": "USD",
+        "currency_exchange_rate": "1.0000000000",
+        "subtotal_ex_tax": "109.6300",
+        "subtotal_inc_tax": "118.4000",
+        "discount_amount": "0.0000",
+        "coupon_discount": "0.0000",
+        "shipping_cost_ex_tax": "9.2600",
+        "shipping_cost_inc_tax": "10.0000",
+        "handling_cost_inc_tax": "0.0000",
+        "wrapping_cost_inc_tax": "0.0000",
+        "total_ex_tax": "118.8900",
+        "total_inc_tax": "128.4000",
+        "total_tax": "9.5100",
+        "refunded_amount": "0.0000",
+        "store_credit_amount": "0.0000",
+        "gift_certificate_amount": "0.0000",
+        "payment_method": "Credit Card",
+        "payment_status": "captured",
+        "payment_provider_id": "ch_3Q0000000000",
+        "shipping_address_count": 1,
+        "ip_address": "203.0.113.42",
+        "ip_address_v6": "2001:db8::2a",
+        "geoip_country": "United States",
+        "geoip_country_iso2": "US",
+        "is_email_opt_in": true,
+        "customer_locale": "en",
+        "billing_address": {
+          "first_name": "Ada",
+          "last_name": "Byron",
+          "company": "Analytical Engines",
+          "street_1": "1 Analytical Way",
+          "street_2": "Suite 2",
+          "city": "Dallas",
+          "state": "Texas",
+          "zip": "75201",
+          "country": "United States",
+          "country_iso2": "US",
+          "email": "buyer@example.test",
+          "phone": "555-0100"
+        },
+        "products": { "url": "https://api.bigcommerce.com/stores/abc123/v2/orders/1042/products", "resource": "/orders/1042/products" },
+        "shipping_addresses": { "url": "https://api.bigcommerce.com/stores/abc123/v2/orders/1042/shipping_addresses", "resource": "/orders/1042/shipping_addresses" }
+      }
+    },
+    "/v2/orders/{order_id}/products": {
+      "source": "admin-management-orders.json — GET /v2/orders/{order_id}/products",
+      "body": [
+        {
+          "id": 1,
+          "order_id": 1042,
+          "product_id": 42,
+          "variant_id": 77,
+          "name": "Pipe Wrench 14\"",
+          "sku": "PW-14-RED",
+          "quantity": 2,
+          "base_price": "24.9900",
+          "price_inc_tax": "26.9900",
+          "total_inc_tax": "53.9800",
+          "quantity_shipped": 2
+        }
+      ]
+    },
+    "/v3/customers": {
+      "source": "admin-management-customers-v3.json — GET /v3/customers",
+      "body": {
+        "data": [
+          {
+            "id": 55,
+            "email": "buyer@example.test",
+            "first_name": "Ada",
+            "last_name": "Byron",
+            "company": "Analytical Engines",
+            "phone": "555-0100",
+            "customer_group_id": 2,
+            "date_created": "2026-01-02T00:00:00Z",
+            "date_modified": "2026-10-01T00:00:00Z",
+            "registration_ip_address": "203.0.113.42",
+            "notes": "Net 30."
+          }
+        ],
+        "meta": { "pagination": { "total": 1, "count": 1, "per_page": 50, "current_page": 1, "total_pages": 1 } }
+      }
+    },
+    "/v3/inventory/items": {
+      "source": "admin-management-inventory.json#/components/schemas/ItemResponse",
+      "body": {
+        "data": [
+          {
+            "identity": { "sku": "PW-14-RED", "variant_id": 77, "product_id": 42, "sku_id": 1 },
+            "locations": [
+              {
+                "location_id": 1,
+                "location_code": "DAL",
+                "location_name": "Dallas Warehouse",
+                "available_to_sell": 4,
+                "total_inventory_onhand": 6,
+                "qty_backordered": 0,
+                "location_enabled": true,
+                "settings": { "safety_stock": 2, "is_in_stock": true, "warning_level": 3 }
+              },
+              {
+                "location_id": 2,
+                "location_code": "AUS",
+                "location_name": "Austin Store",
+                "available_to_sell": 0,
+                "total_inventory_onhand": 1,
+                "qty_backordered": 3,
+                "location_enabled": true,
+                "settings": { "safety_stock": 1, "is_in_stock": false, "warning_level": 1 }
+              }
+            ]
+          },
+          {
+            "identity": { "sku": "PW-18", "variant_id": 79, "product_id": 43, "sku_id": 2 },
+            "locations": [
+              {
+                "location_id": 1,
+                "location_code": "DAL",
+                "location_name": "Dallas Warehouse",
+                "available_to_sell": 11,
+                "total_inventory_onhand": 11,
+                "qty_backordered": 0,
+                "location_enabled": true,
+                "settings": { "safety_stock": 0, "is_in_stock": true }
+              }
+            ]
+          }
+        ],
+        "meta": { "pagination": { "total": 2, "count": 2, "per_page": 50, "current_page": 1, "total_pages": 1 } }
+      }
+    },
+    "/v3/inventory/locations": {
+      "source": "admin-management-inventory.json#/components/schemas/LocationResponse",
+      "body": {
+        "data": [
+          {
+            "id": 1,
+            "code": "DAL",
+            "label": "Dallas Warehouse",
+            "description": "Main fulfilment warehouse",
+            "type_id": "PHYSICAL",
+            "enabled": true,
+            "storefront_visibility": true,
+            "managed_by_external_source": false,
+            "time_zone": "America/Chicago",
+            "address": {
+              "address1": "100 Commerce St",
+              "city": "Dallas",
+              "state": "Texas",
+              "zip": "75201",
+              "country_code": "USA",
+              "phone": "555-0199"
+            }
+          },
+          {
+            "id": 2,
+            "code": "AUS",
+            "label": "Austin Store",
+            "type_id": "PHYSICAL",
+            "enabled": false,
+            "storefront_visibility": true,
+            "time_zone": "America/Chicago",
+            "address": { "city": "Austin", "state": "Texas", "country_code": "USA" }
+          }
+        ],
+        "meta": { "pagination": { "total": 2, "count": 2, "per_page": 50, "current_page": 1, "total_pages": 1 } }
+      }
+    }
+  }
+}
