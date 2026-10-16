@@ -124,6 +124,9 @@ function reply(id, result) {
 
 const hostCalls = [];
 
+/** When set, the host answers `config.get` with nothing configured. */
+let unconfigured = false;
+
 createInterface({ input: child.stdout }).on("line", (line) => {
   if (!line.trim()) return;
   let msg;
@@ -148,11 +151,16 @@ createInterface({ input: child.stdout }).on("line", (line) => {
   if (msg.method) {
     hostCalls.push(msg.method);
     if (msg.method === "config.get") {
-      reply(msg.id, {
-        storeHash: STORE_HASH,
-        accessToken: { type: "secret_ref", secretId: "secret-smoke" },
-        apiOrigin,
-      });
+      reply(
+        msg.id,
+        unconfigured
+          ? {}
+          : {
+              storeHash: STORE_HASH,
+              accessToken: { type: "secret_ref", secretId: "secret-smoke" },
+              apiOrigin,
+            },
+      );
     } else if (msg.method === "secrets.resolve") {
       reply(msg.id, TOKEN);
     } else if (msg.id !== undefined) {
@@ -179,6 +187,53 @@ const runContext = {
   projectId: "project-smoke",
 };
 
+/**
+ * The host's forwarding rule, copied from `server/src/routes/tool-gateway.ts`
+ * (the `tools/call` branch of `/api/mcp/gateways/:gatewayPublicId`, which is
+ * the `paperclip-assigned` MCP server an agent run mounts):
+ *
+ *   content:           [{ type: "text", text: <result.content ?? JSON(data)> }]
+ *   structuredContent: result.data ?? null
+ *
+ * Note the `?? null`. `error` is not one of the two fields that travel, so a
+ * `ToolResult` carrying only `error` arrives at the agent as an explicit
+ * `structuredContent: null` — which the client's schema rejects, discarding
+ * `content` along with it. That is BRO-181: every call to this plugin read as
+ * `expected record, received null` instead of naming its own cause. Checked
+ * here, against the built worker, as well as in the unit suite.
+ */
+const forwardAsMcpResult = (result) => ({
+  content: [
+    {
+      type: "text",
+      text: typeof result?.content === "string"
+        ? result.content
+        : JSON.stringify(result?.data ?? result ?? null),
+    },
+  ],
+  structuredContent: result?.data ?? null,
+});
+
+/** The client-side schema check that rejected every call from this plugin. */
+const clientAcceptsStructuredContent = (value) =>
+  value !== null && typeof value === "object" && !Array.isArray(value);
+
+/** Fail unless a result would survive the round trip to an agent intact. */
+function assertForwardable(label, result) {
+  const forwarded = forwardAsMcpResult(result);
+  if (!clientAcceptsStructuredContent(forwarded.structuredContent)) {
+    fail(
+      `${label} produced structuredContent the agent's client rejects: ${JSON.stringify(
+        forwarded.structuredContent,
+      )}`,
+    );
+  }
+  if (typeof forwarded.content[0].text !== "string" || forwarded.content[0].text === "") {
+    fail(`${label} forwarded an empty text block`);
+  }
+  return forwarded;
+}
+
 /** Every tool this run drove, so the "every tool" claim below is checked. */
 const toolsCalled = new Set();
 
@@ -191,7 +246,29 @@ const callTool = (toolName, parameters) => {
 async function ok(toolName, parameters = {}) {
   const result = await callTool(toolName, parameters);
   if (result?.error) fail(`${toolName} returned an error: ${result.error}`);
+  assertForwardable(toolName, result);
   return result.data;
+}
+
+/**
+ * Call one tool, require it to fail with a message matching `expected`, and
+ * require that message to reach the agent through both fields the host
+ * forwards. Checking `error` alone is what let the original defect ship: the
+ * plugin wrote the right message into the one field that is never sent.
+ */
+async function failsWith(toolName, parameters, expected) {
+  const result = await callTool(toolName, parameters);
+  if (!expected.test(result?.error ?? "")) {
+    fail(`${toolName} error did not match ${expected}: ${JSON.stringify(result?.error)}`);
+  }
+  const forwarded = assertForwardable(`${toolName} (error path)`, result);
+  if (!expected.test(forwarded.content[0].text)) {
+    fail(`${toolName}'s message never reached the agent's text block`);
+  }
+  if (!expected.test(JSON.stringify(forwarded.structuredContent))) {
+    fail(`${toolName}'s message never reached structuredContent`);
+  }
+  return result.error;
 }
 
 try {
@@ -343,15 +420,34 @@ try {
   }
   console.log(`list_locations: ${locations.locations.length} location(s), filtered by location_id:in`);
 
-  const scoped = await callTool("list_customers", { email: "denied@example.test" });
-  console.log("list_customers(403) ->", JSON.stringify(scoped?.error));
-  if (!/OAuth scope/.test(scoped?.error ?? "")) fail("a 403 should name the missing scope");
+  const scoped = await failsWith(
+    "list_customers",
+    { email: "denied@example.test" },
+    /OAuth scope/,
+  );
+  console.log("list_customers(403) ->", JSON.stringify(scoped), "(reached the agent)");
 
-  const badArgument = await callTool("get_product", { productId: "forty-two" });
-  console.log("get_product(bad id) ->", JSON.stringify(badArgument?.error));
-  if (!/must be an integer/.test(badArgument?.error ?? "")) {
-    fail("a bad argument should surface as a fixable tool error");
-  }
+  const badArgument = await failsWith(
+    "get_product",
+    { productId: "forty-two" },
+    /must be an integer/,
+  );
+  console.log("get_product(bad id) ->", JSON.stringify(badArgument), "(reached the agent)");
+
+  // An unconfigured store hash is the first thing an operator gets wrong, and
+  // it is a config failure rather than a request failure — a different branch
+  // of the same error path, and the branch most likely to be what a freshly
+  // installed plugin is actually hitting. The worker reads config per call, so
+  // answering the next `config.get` with an empty object exercises it against
+  // the real build.
+  unconfigured = true;
+  const missingConfig = await failsWith(
+    "get_catalog_summary",
+    {},
+    /no BigCommerce store hash configured/,
+  );
+  unconfigured = false;
+  console.log("get_catalog_summary(unconfigured) ->", JSON.stringify(missingConfig));
 
   console.log("host calls made by worker:", [...new Set(hostCalls)].join(", "));
   console.log("stub store saw requests:", seenRequests.length);

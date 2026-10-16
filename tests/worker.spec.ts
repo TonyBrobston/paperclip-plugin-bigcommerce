@@ -5,6 +5,7 @@
  * reads, secret resolution and the error contract are exercised through the
  * same calls the real host makes rather than through direct imports.
  */
+import type { ToolResult } from "@paperclipai/plugin-sdk";
 import { createTestHarness } from "@paperclipai/plugin-sdk/testing";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { TOOL_NAMES } from "../src/constants.js";
@@ -290,5 +291,204 @@ describe("onValidateConfig", () => {
     const result = await plugin.definition.onValidateConfig!({});
     expect(result.ok).toBe(false);
     expect(result.errors).toHaveLength(2);
+  });
+});
+
+/**
+ * The host's forwarding rule, copied from `server/src/routes/tool-gateway.ts`
+ * (the `tools/call` branch of `/api/mcp/gateways/:gatewayPublicId`, which is
+ * the `paperclip-assigned` MCP server every heartbeat run mounts):
+ *
+ * ```ts
+ * const contentText = typeof resultRecord?.content === "string"
+ *   ? resultRecord.content
+ *   : JSON.stringify(resultRecord?.data ?? result.result ?? null);
+ * res.json({ result: {
+ *   content: [{ type: "text", text: contentText }],
+ *   structuredContent: resultRecord?.data ?? null,
+ *   isError: false,
+ * } });
+ * ```
+ *
+ * Note `?? null`: an absent `data` is forwarded as an explicit `null`, and the
+ * client's schema requires a record there. So a `ToolResult` carrying only
+ * `error` is discarded in full — `error` is not one of the two fields that
+ * travel. That is the whole of BRO-181: every BigCommerce tool call reached the
+ * agent as `structuredContent: expected record, received null` rather than as
+ * whatever had actually gone wrong. This copy exists so a regression fails here
+ * rather than silently shipping a tool whose every failure reads as a transport
+ * error.
+ */
+function forwardAsMcpResult(result: ToolResult) {
+  const contentText =
+    typeof result.content === "string"
+      ? result.content
+      : JSON.stringify(result.data ?? result ?? null);
+  return {
+    content: [{ type: "text", text: contentText }],
+    structuredContent: result.data ?? null,
+  };
+}
+
+/** The client-side schema check that rejected every call from this plugin. */
+function clientAcceptsStructuredContent(value: unknown): boolean {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+describe("results survive the host's MCP forwarding", () => {
+  it("a success carries structured data the client will accept", async () => {
+    const harness = await harnessWith(CONFIG);
+    stubFetch({ data: { inventory_count: 12, variant_count: 30 } });
+    const result = await harness.executeTool(TOOL_NAMES.getCatalogSummary, {});
+    const forwarded = forwardAsMcpResult(result);
+    expect(clientAcceptsStructuredContent(forwarded.structuredContent)).toBe(true);
+    expect(forwarded.structuredContent).toMatchObject({ inventoryCount: 12 });
+  });
+
+  /**
+   * Both body shapes, because the two API versions disagree: v3 answers
+   * `{ data, meta }` and v2 answers a bare array. A tool that forwarded either
+   * one unwrapped would produce an array `structuredContent`, which the client
+   * rejects exactly as it rejects `null`.
+   */
+  it.each([
+    ["a v3 envelope", { data: [], meta: {} } as unknown],
+    ["a bare v2 array", [] as unknown],
+  ])("every tool's result is forwardable given %s", async (_label, body) => {
+    const harness = await harnessWith(CONFIG);
+    for (const tool of TOOL_DECLARATIONS) {
+      stubFetch(body);
+      const result = await harness.executeTool(tool.name, defaultParamsFor(tool.name));
+      expect(
+        clientAcceptsStructuredContent(forwardAsMcpResult(result).structuredContent),
+        `${tool.name} produced structuredContent the client rejects`,
+      ).toBe(true);
+    }
+  });
+
+  /**
+   * Each row is one of the distinct causes this plugin writes a specific
+   * message for. Before the fix all of them reached the agent as the same
+   * schema error, which is why the live cause of a failing install could not be
+   * read from the agent side at all.
+   */
+  const failures: Array<[string, () => void, RegExp]> = [
+    [
+      "an unreachable store",
+      () => {
+        vi.stubGlobal("fetch", async () => {
+          throw new Error("connect ECONNREFUSED");
+        });
+      },
+      /could not be reached/,
+    ],
+    ["a rejected token", () => stubFetch({}, 401), /rejected the access token/],
+    ["a missing OAuth scope", () => stubFetch({}, 403), /does not have the OAuth scope/],
+    ["an unknown record", () => stubFetch({}, 404), /no such record/],
+    ["a rate limit", () => stubFetch({}, 429), /rate-limited this request/],
+    ["a store-side failure", () => stubFetch({}, 503), /server error \(503\)/],
+    [
+      "a body that is not JSON",
+      () => stubFetch("<html>maintenance</html>"),
+      /could not parse as JSON/,
+    ],
+  ];
+
+  it.each(failures)("%s reaches the agent", async (_label, arrange, expected) => {
+    arrange();
+    const harness = await harnessWith(CONFIG);
+    const result = await harness.executeTool(TOOL_NAMES.getCatalogSummary, {});
+
+    expect(result.error).toMatch(expected);
+    // The two fields that actually travel.
+    expect(result.content).toMatch(expected);
+    expect(clientAcceptsStructuredContent(result.data)).toBe(true);
+
+    const forwarded = forwardAsMcpResult(result);
+    expect(clientAcceptsStructuredContent(forwarded.structuredContent)).toBe(true);
+    expect(forwarded.content[0]!.text).toMatch(expected);
+  });
+
+  it("an unconfigured install says so instead of failing as a schema error", async () => {
+    const harness = await harnessWith({});
+    const result = await harness.executeTool(TOOL_NAMES.getCatalogSummary, {});
+    expect(result.content).toMatch(/no BigCommerce store hash configured/);
+    expect(clientAcceptsStructuredContent(forwardAsMcpResult(result).structuredContent)).toBe(
+      true,
+    );
+  });
+
+  it("a bad argument comes back as this plugin's own message", async () => {
+    const harness = await harnessWith(CONFIG);
+    stubFetch({});
+    const result = await harness.executeTool(TOOL_NAMES.getProduct, {
+      productId: "forty-two",
+    });
+    expect(result.content).toMatch(/"productId" must be an integer/);
+    expect(clientAcceptsStructuredContent(forwardAsMcpResult(result).structuredContent)).toBe(
+      true,
+    );
+  });
+
+  /**
+   * The four tools BRO-181 names as its acceptance criteria, driven through the
+   * host's forwarding rule so the ticket's "done when" is a test rather than a
+   * claim.
+   */
+  it("returns forwardable data for the four tools BRO-181 requires", async () => {
+    const harness = await harnessWith(CONFIG);
+    const bodies: Record<string, unknown> = {
+      [TOOL_NAMES.getCatalogSummary]: { data: { inventory_count: 3 } },
+      [TOOL_NAMES.listProducts]: { data: [{ id: 1, name: "Kit", sku: "KIT-1" }], meta: {} },
+      [TOOL_NAMES.listOrders]: [{ id: 1042, status: "Shipped", total_inc_tax: "19.99" }],
+      [TOOL_NAMES.listInventory]: { data: [], meta: {} },
+    };
+    for (const [name, body] of Object.entries(bodies)) {
+      stubFetch(body);
+      const result = await harness.executeTool(name, {});
+      expect(result.error, `${name} errored: ${String(result.error)}`).toBeUndefined();
+      expect(
+        clientAcceptsStructuredContent(forwardAsMcpResult(result).structuredContent),
+        name,
+      ).toBe(true);
+    }
+  });
+});
+
+describe("failures are visible to the operator too", () => {
+  it("logs a warning naming the tool and the reason", async () => {
+    const harness = await harnessWith(CONFIG);
+    stubFetch({}, 401);
+    await harness.executeTool(TOOL_NAMES.getCatalogSummary, {});
+
+    const warning = harness.logs.find((entry) => entry.level === "warn");
+    expect(warning, "no warning reached the plugin log").toBeDefined();
+    expect(warning!.meta?.tool).toBe(TOOL_NAMES.getCatalogSummary);
+    expect(String(warning!.meta?.reason)).toMatch(/rejected the access token/);
+  });
+
+  it("logs an unexpected error without putting its text in the log's reason", async () => {
+    const harness = await harnessWith(CONFIG);
+    // A body that fails mid-stream throws past the request wrapper, so this is
+    // the branch whose message the agent must not see.
+    vi.stubGlobal(
+      "fetch",
+      async () =>
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.error(new TypeError("secret-bearing internal detail"));
+            },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+    );
+    const result = await harness.executeTool(TOOL_NAMES.getCatalogSummary, {});
+    expect(result.error).toBe("The BigCommerce request failed.");
+
+    const warning = harness.logs.find((entry) => entry.level === "warn");
+    expect(warning).toBeDefined();
+    expect(String(warning!.meta?.reason)).toBe("unexpected TypeError");
+    expect(JSON.stringify(warning)).not.toMatch(/secret-bearing/);
   });
 });

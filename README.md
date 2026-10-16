@@ -278,6 +278,38 @@ field.
 
 A few shapes are worth knowing before an agent's first call.
 
+**Every result — success or failure — is a JSON object, and that is a hard
+requirement rather than a style.** The host turns a tool result into an MCP
+reply with two fields and only two:
+
+```ts
+// server/src/routes/tool-gateway.ts, the tools/call branch
+content:           [{ type: "text", text: result.content ?? JSON.stringify(result.data) }]
+structuredContent: result.data ?? null
+```
+
+`error` is not one of them. So a result carrying only `error` arrives as
+`structuredContent: null`, the agent's client rejects it against a schema that
+requires a record there, and `content` is discarded along with it — the agent
+sees a transport error and never the message. That is what made every call to
+this plugin read as
+
+```
+MCP server "paperclip-assigned" returned a malformed result that failed schema
+validation: [{ "expected": "record", "path": ["structuredContent"],
+"message": "Invalid input: expected record, received null" }]
+```
+
+no matter what had actually gone wrong. Both halves are now set on every path:
+a failure returns `{ error, content, data: { error } }`, and `worker.ts` passes
+every success through a `structured()` backstop so a tool that returned an array
+or a scalar could not reintroduce the fault. The host's forwarding rule and the
+client's record check are copied into `tests/worker.spec.ts`,
+`tests/forwarding-backstop.spec.ts` and `scripts/smoke.mjs`, so a regression
+fails in this repo rather than shipping a plugin whose every result is dropped.
+A failure is also logged as a warning naming the tool and the reason, so it is
+visible on the plugin health page even if the agent's transport drops it.
+
 **Lists are compact; `get_*` is fuller.** A BigCommerce product carries its
 whole HTML description and every SEO field; an order carries three addresses and
 a dozen money fields. A page of those is mostly payload a run will not read, and
@@ -511,9 +543,16 @@ them locally.
 
 The unit tests are fixture-backed and the smoke test runs against a stub, so
 together they prove this plugin's behaviour — not any particular BigCommerce
-store. **Nothing here has touched a real BigCommerce store, and the plugin has
-not been installed on a running Paperclip.** The first real exercise is
-configuring it and asking an agent to run `get_store_info`.
+store. **Nothing here has touched a real BigCommerce store.**
+
+The plugin *is* installed on a running Paperclip and has been called by an
+agent, but only far enough to find the result-shape defect above: every call
+came back as a schema error, so no call has yet returned store data. Whatever
+was failing underneath it has therefore never been read. Once this version is
+deployed and the worker restarts, the first call prints its own cause — a
+missing store hash, a missing or stale token, a missing OAuth scope, or an
+unreachable store are separate messages — and that is the next thing to look at,
+not a second round of guessing.
 
 Endpoint paths, query-parameter names and response shapes are checked against
 BigCommerce's machine-readable OpenAPI specs by `tests/openapi-contract.spec.ts`

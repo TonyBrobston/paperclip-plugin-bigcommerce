@@ -43319,11 +43319,23 @@ async function resolveClientOptions(ctx, companyId) {
     ...typeof apiOrigin === "string" && apiOrigin.trim() !== "" ? { apiOrigin } : {}
   };
 }
-function toolError(error62) {
-  if (error62 instanceof InvalidParameterError || error62 instanceof BigCommerceError) {
-    return { error: error62.message };
+function structured(data) {
+  if (data !== null && typeof data === "object" && !Array.isArray(data)) {
+    return data;
   }
-  return { error: "The BigCommerce request failed." };
+  return { value: data };
+}
+function toolError(ctx, toolName, companyId, error62) {
+  const expected = error62 instanceof InvalidParameterError || error62 instanceof BigCommerceError;
+  const message2 = expected ? error62.message : "The BigCommerce request failed.";
+  ctx.logger.warn("BigCommerce tool call failed", {
+    tool: toolName,
+    companyId,
+    // An unexpected error's own text is withheld from the agent; the log is
+    // operator-facing, so record its class to make one diagnosable.
+    reason: expected ? message2 : `unexpected ${error62?.name ?? "error"}`
+  });
+  return { error: message2, content: message2, data: { error: message2 } };
 }
 var plugin = definePlugin({
   async setup(ctx) {
@@ -43338,7 +43350,9 @@ var plugin = definePlugin({
         async (params, runCtx) => {
           try {
             const options = await resolveClientOptions(ctx, runCtx.companyId);
-            const data = await executeTool(options, declaration.name, params);
+            const data = structured(
+              await executeTool(options, declaration.name, params)
+            );
             return {
               // The agent reads `content`; `data` keeps the structured form
               // for anything that consumes the result programmatically.
@@ -43346,7 +43360,7 @@ var plugin = definePlugin({
               data
             };
           } catch (error62) {
-            return toolError(error62);
+            return toolError(ctx, declaration.name, runCtx.companyId, error62);
           }
         }
       );
